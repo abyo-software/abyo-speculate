@@ -28,6 +28,7 @@ use abyo_speculate::model::qwen2::Qwen2Decoder;
 use abyo_speculate::model::qwen2_local::Config;
 use abyo_speculate::model::Decoder;
 use abyo_speculate::tree::DraftTree;
+use abyo_speculate::{Method, SpeculateEngine};
 use candle_core::{DType, Device};
 use rand::SeedableRng;
 
@@ -233,4 +234,24 @@ fn medusa_pipeline_with_synthetic_heads() {
     }
     let text = target.decode(&out, true).unwrap();
     println!("synthetic-heads Medusa output: {text}");
+}
+
+#[test]
+#[ignore = "downloads ~1GB and requires GPU for tolerable speed"]
+fn engine_generate_text_end_to_end() {
+    // Verifies the SpeculateEngine.generate(text) text-in / text-out path:
+    //  builder → with_target → generate(prompt, max_tokens) → String.
+    let target = load_decoder();
+    let mut engine = SpeculateEngine::builder()
+        .target_model(REPO)
+        .method(Method::Autoregressive)
+        .seed(42)
+        .build()
+        .unwrap()
+        .with_target(target);
+
+    assert!(engine.is_ready());
+    let out = engine.generate("The capital of France is", 16).unwrap();
+    println!("engine.generate text output: {out}");
+    assert!(!out.trim().is_empty());
 }

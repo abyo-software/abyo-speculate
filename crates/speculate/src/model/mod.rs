@@ -70,6 +70,27 @@ pub trait Decoder {
     /// the simple Phase-1a path, a `clear_kv_cache` followed by re-observation
     /// of the prefix).
     fn rollback_to(&mut self, len: usize) -> Result<()>;
+
+    /// Tokenize `text` to model token ids. Default impl returns
+    /// `Error::UnsupportedMethod` — implementations that bundle a tokenizer
+    /// (Qwen2Decoder, LlamaDecoder) override this.
+    fn encode(&self, text: &str, add_special_tokens: bool) -> Result<Vec<u32>> {
+        let _ = (text, add_special_tokens);
+        Err(crate::Error::UnsupportedMethod {
+            method: "encode",
+            reason: "this decoder has no bundled tokenizer".into(),
+        })
+    }
+
+    /// Detokenize ids back to a string. Same default-error behaviour as
+    /// [`Self::encode`].
+    fn decode(&self, ids: &[u32], skip_special_tokens: bool) -> Result<String> {
+        let _ = (ids, skip_special_tokens);
+        Err(crate::Error::UnsupportedMethod {
+            method: "decode",
+            reason: "this decoder has no bundled tokenizer".into(),
+        })
+    }
 }
 
 /// Capability trait for decoders that support tree-attention SD methods

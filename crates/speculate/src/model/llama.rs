@@ -232,6 +232,14 @@ impl crate::model::TreeDecoder for LlamaDecoder {
 }
 
 impl Decoder for LlamaDecoder {
+    fn encode(&self, text: &str, add_special_tokens: bool) -> Result<Vec<u32>> {
+        LlamaDecoder::encode(self, text, add_special_tokens)
+    }
+
+    fn decode(&self, ids: &[u32], skip_special_tokens: bool) -> Result<String> {
+        LlamaDecoder::decode(self, ids, skip_special_tokens)
+    }
+
     fn vocab_size(&self) -> usize {
         self.vocab_size
     }

@@ -286,6 +286,14 @@ impl crate::model::TreeDecoder for Qwen2Decoder {
 }
 
 impl Decoder for Qwen2Decoder {
+    fn encode(&self, text: &str, add_special_tokens: bool) -> Result<Vec<u32>> {
+        Qwen2Decoder::encode(self, text, add_special_tokens)
+    }
+
+    fn decode(&self, ids: &[u32], skip_special_tokens: bool) -> Result<String> {
+        Qwen2Decoder::decode(self, ids, skip_special_tokens)
+    }
+
     fn vocab_size(&self) -> usize {
         self.vocab_size
     }

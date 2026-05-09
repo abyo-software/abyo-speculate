@@ -164,22 +164,25 @@ impl SpeculateEngine {
         }
     }
 
-    /// Friendly text-in / text-out wrapper. Returns `Err` if no target model
-    /// has been attached, or if the target model has no associated tokenizer
-    /// (custom decoders without tokenization can use [`Self::generate_tokens`]
-    /// directly).
+    /// Friendly text-in / text-out wrapper.
+    ///
+    /// Tokenizes via the target decoder's bundled tokenizer, runs
+    /// [`Self::generate_tokens`], detokenizes the output. Errors with
+    /// [`Error::MissingField`] if no target is attached or
+    /// [`Error::UnsupportedMethod`] if the attached target has no tokenizer
+    /// (e.g. a mock decoder used in tests — call `generate_tokens` directly
+    /// for those).
     pub fn generate(&mut self, prompt: &str, max_tokens: usize) -> Result<String> {
-        let _ = (prompt, max_tokens);
-        // The Decoder trait is intentionally tokenizer-agnostic. Tokenization
-        // belongs to the concrete decoder (e.g. Qwen2Decoder::encode/decode).
-        // For now we expose a clear error directing callers to the lower-level
-        // path — wrapping tokenization here would require either coupling
-        // Decoder to tokenizers or duplicating the API.
-        Err(Error::Other(anyhow::anyhow!(
-            "engine.generate(text) requires a tokenizer-aware backend; \
-             use the model's encode + engine.generate_tokens + decode directly. \
-             A higher-level wrapper lands when the Backend trait stabilizes."
-        )))
+        if !self.is_ready() {
+            return Err(Error::MissingField(
+                "models not loaded — call with_target / with_draft first",
+            ));
+        }
+        let target = self.target.as_ref().unwrap();
+        let prompt_ids = target.encode(prompt, true)?;
+        let out_ids = self.generate_tokens(&prompt_ids, max_tokens)?;
+        let target = self.target.as_ref().unwrap();
+        target.decode(&out_ids, true)
     }
 }
 
