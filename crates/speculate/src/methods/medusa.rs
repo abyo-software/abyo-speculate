@@ -657,6 +657,15 @@ impl MedusaHeadsCandle {
         dtype: DType,
     ) -> Result<Self> {
         let vb = VarBuilder::from_pth(path.as_ref(), dtype, device).map_err(Error::Candle)?;
+        Self::from_fasterdecoding_var_builder(cfg, vb)
+    }
+
+    /// Same key layout as [`Self::from_fasterdecoding_pt`] but reads via a
+    /// caller-supplied [`VarBuilder`]. Use the caller's
+    /// `vb.pp("medusa_head")` for bundled checkpoints (where the heads sit
+    /// under that prefix alongside the base model), or pass `vb` at root
+    /// for heads-only files.
+    pub fn from_fasterdecoding_var_builder(cfg: &MedusaConfig, vb: VarBuilder<'_>) -> Result<Self> {
         let mut heads = Vec::with_capacity(cfg.n_heads);
         for i in 0..cfg.n_heads {
             let head_vb = vb.pp(i.to_string());

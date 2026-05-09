@@ -67,6 +67,20 @@ impl LlamaDecoder {
         let vb = unsafe {
             VarBuilder::from_mmaped_safetensors(&paths, dtype, &device).map_err(Error::Candle)?
         };
+        Self::from_var_builder(config, vb, tokenizer_path, device, dtype)
+    }
+
+    /// Load from a caller-supplied [`VarBuilder`], e.g. when the weights
+    /// come from a non-safetensors source like
+    /// [`crate::model::hub::MultiPthBackend`] (sharded PyTorch .bin) or a
+    /// custom test-only [`candle_nn::var_builder::SimpleBackend`].
+    pub fn from_var_builder(
+        config: &Config,
+        vb: VarBuilder<'_>,
+        tokenizer_path: impl AsRef<Path>,
+        device: Device,
+        dtype: DType,
+    ) -> Result<Self> {
         let model = Llama::load(vb.clone(), config).map_err(Error::Candle)?;
         let lm_head = if config.tie_word_embeddings {
             Linear::new(model.embed_tokens_weight().clone(), None)
