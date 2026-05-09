@@ -61,20 +61,24 @@ fn parse_device_spec(spec: &str) -> Result<Device> {
 mod tests {
     use super::*;
 
+    // The two env-var paths are tested via `parse_device_spec` directly so
+    // that parallel test execution does not race on the shared
+    // `ABYO_SPECULATE_DEVICE` global.
+
     #[test]
-    fn cpu_always_available() {
-        // Without env override, on CI this should always succeed.
-        std::env::remove_var("ABYO_SPECULATE_DEVICE");
-        let d = auto_device().expect("auto_device should not fail");
-        // We don't assert *which* device, only that we got something.
-        let _ = d;
+    fn parse_explicit_cpu_spec() {
+        let d = parse_device_spec("cpu").unwrap();
+        assert!(matches!(d, Device::Cpu));
     }
 
     #[test]
-    fn explicit_cpu_spec() {
-        std::env::set_var("ABYO_SPECULATE_DEVICE", "cpu");
-        let d = auto_device().unwrap();
+    fn parse_uppercase_cpu_spec() {
+        let d = parse_device_spec("CPU").unwrap();
         assert!(matches!(d, Device::Cpu));
-        std::env::remove_var("ABYO_SPECULATE_DEVICE");
+    }
+
+    #[test]
+    fn parse_unknown_spec_errors() {
+        assert!(parse_device_spec("not-a-device").is_err());
     }
 }
