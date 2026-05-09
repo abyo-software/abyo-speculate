@@ -5,6 +5,7 @@
 //! future work (real models, Medusa heads, EAGLE feature draft) can plug in
 //! without disturbing the SD verification loop.
 
+pub mod hub;
 pub mod loader;
 pub mod mock;
 pub mod qwen2;

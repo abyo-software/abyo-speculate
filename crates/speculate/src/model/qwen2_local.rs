@@ -445,15 +445,18 @@ impl Model {
                 })
             })
             .collect();
-        let mask = Tensor::from_slice(&mask, (tgt_len, tgt_len), &self.device)?;
+        // The slice was built as f32; promote to self.dtype *before* the
+        // optional cat so we don't try to mix BF16/F16 mask0 with an F32
+        // causal block (upstream qwen2 hits this when run with non-F32 dtype).
+        let mask =
+            Tensor::from_slice(&mask, (tgt_len, tgt_len), &self.device)?.to_dtype(self.dtype)?;
         let mask = if seqlen_offset > 0 {
             let mask0 = Tensor::zeros((tgt_len, seqlen_offset), self.dtype, &self.device)?;
             Tensor::cat(&[&mask0, &mask], D::Minus1)?
         } else {
             mask
         };
-        mask.expand((b_size, 1, tgt_len, tgt_len + seqlen_offset))?
-            .to_dtype(self.dtype)
+        mask.expand((b_size, 1, tgt_len, tgt_len + seqlen_offset))
     }
 
     /// Plain autoregressive forward. Same surface as upstream

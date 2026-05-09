@@ -26,8 +26,8 @@ candle-transformers = { version = "0.8", default-features = false }
 # Tokenization
 tokenizers = { version = "0.20", default-features = false, features = ["onig"] }
 
-# Model download
-hf-hub = { version = "0.3", default-features = false, features = ["tokio"] }
+# Model download (sync API via ureq — `tokio` feature is async-only)
+hf-hub = { version = "0.3", default-features = false, features = ["online"] }
 
 # Async / runtime
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
