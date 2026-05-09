@@ -123,4 +123,16 @@ pub trait TreeDecoder: Decoder {
     /// Per-node next-token logit distributions for `tree`. Output length =
     /// `tree.len()`. Cache state restored.
     fn tree_logits(&mut self, tree: &crate::tree::DraftTree) -> Result<Vec<Vec<f32>>>;
+
+    /// Project a hidden state `[batch, seq, hidden]` (or `[batch, hidden]`)
+    /// to logits over the model's vocab. Used by EAGLE drafts that share the
+    /// target's lm_head. Default impl returns `UnsupportedMethod` — only
+    /// real-model decoders need to implement this.
+    fn apply_lm_head(&self, hidden: &candle_core::Tensor) -> Result<candle_core::Tensor> {
+        let _ = hidden;
+        Err(crate::Error::UnsupportedMethod {
+            method: "apply_lm_head",
+            reason: "this TreeDecoder does not expose its lm_head".into(),
+        })
+    }
 }

@@ -381,8 +381,20 @@ impl EagleDraftCandle {
             .embed_tokens
             .forward(token_ids)
             .map_err(Error::Candle)?;
+        // The target may dequantize to F32 (quantized_llama path) while
+        // the draft was loaded in F16. Promote target_hidden to the
+        // draft's dtype before concat.
+        let target_hidden_owned;
+        let target_hidden_use: &Tensor = if target_hidden.dtype() != token_emb.dtype() {
+            target_hidden_owned = target_hidden
+                .to_dtype(token_emb.dtype())
+                .map_err(Error::Candle)?;
+            &target_hidden_owned
+        } else {
+            target_hidden
+        };
         let combined =
-            Tensor::cat(&[target_hidden, &token_emb], D::Minus1).map_err(Error::Candle)?;
+            Tensor::cat(&[target_hidden_use, &token_emb], D::Minus1).map_err(Error::Candle)?;
         let xs = self.fc.forward(&combined).map_err(Error::Candle)?;
         // EAGLE block: attention (no pre-LN) + post_attention_layernorm + mlp.
         let res = xs;
@@ -441,14 +453,12 @@ impl Default for EagleRunConfig {
 /// 5. Walk paths, accept via greedy match (temperature 0 default).
 /// 6. Commit the longest accepted prefix + bonus.
 ///
-/// **NOTE for v0.1.0**: the per-step "draft logits" path here uses the
-/// caller-supplied `lm_head_apply` closure (typically `target.apply_lm_head`)
-/// so we don't need to duplicate the target's vocab head into the draft.
-/// v0.2.0 will integrate this directly into the engine.
-pub fn run_eagle<T, F, R>(
+/// The per-step "draft logits" path uses [`TreeDecoder::apply_lm_head`]
+/// directly — EAGLE shares the target's vocab head via tied embeddings, so
+/// we don't keep a separate copy on the draft.
+pub fn run_eagle<T, R>(
     target: &mut T,
     draft: &mut EagleDraftCandle,
-    mut lm_head_apply: F,
     prompt: &[u32],
     max_new_tokens: usize,
     config: &EagleRunConfig,
@@ -456,7 +466,6 @@ pub fn run_eagle<T, F, R>(
 ) -> Result<Vec<u32>>
 where
     T: TreeDecoder + ?Sized,
-    F: FnMut(&Tensor) -> Result<Tensor>,
     R: rand::Rng + ?Sized,
 {
     use crate::methods::medusa::top_k_indices;
@@ -493,8 +502,14 @@ where
         for step in 0..config.draft_depth {
             let draft_hidden =
                 draft.forward(&current_hidden, &current_token_ids, history_len + step)?;
-            // Apply the target's lm_head to get vocab logits.
-            let logits = lm_head_apply(&draft_hidden)?;
+            // The target's lm_head may be quantized (F32-only input) while
+            // the draft is F16. Promote before applying.
+            let draft_hidden_for_head = if draft_hidden.dtype() != DType::F32 {
+                draft_hidden.to_dtype(DType::F32).map_err(Error::Candle)?
+            } else {
+                draft_hidden.clone()
+            };
+            let logits = target.apply_lm_head(&draft_hidden_for_head)?;
             // Take the last position's logits — for a 1-token forward this
             // is just position 0.
             let last = logits

@@ -109,6 +109,12 @@ impl Qwen2QuantDecoder {
         self.hidden_size
     }
 
+    /// Apply the model's quantized lm_head — exposed so EAGLE's draft loop
+    /// can re-use the target's vocab projection without owning a separate copy.
+    pub fn apply_lm_head(&self, hidden: &Tensor) -> Result<Tensor> {
+        self.model.apply_lm_head(hidden).map_err(Error::Candle)
+    }
+
     pub fn encode(&self, text: &str, add_special_tokens: bool) -> Result<Vec<u32>> {
         let enc = self
             .tokenizer
@@ -233,6 +239,10 @@ impl TreeDecoder for Qwen2QuantDecoder {
 
     fn tree_logits(&mut self, tree: &DraftTree) -> Result<Vec<Vec<f32>>> {
         Qwen2QuantDecoder::tree_logits(self, tree)
+    }
+
+    fn apply_lm_head(&self, hidden: &Tensor) -> Result<Tensor> {
+        Qwen2QuantDecoder::apply_lm_head(self, hidden)
     }
 }
 

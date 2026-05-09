@@ -114,50 +114,16 @@ fn llama3_8b_q4_with_eagle_2_speedup() {
     eprintln!("\n=== EAGLE-2 ===");
     let run_cfg = EagleRunConfig {
         top_k_per_step: 2,
-        draft_depth: 4,
+        draft_depth: 2, // draft_depth × 1 lm_head_apply each; quantized lm_head dominates
         temperature: 0.0,
         top_p: 1.0,
     };
     let mut rng = rand::rngs::StdRng::seed_from_u64(12345);
 
-    // Need an apply-lm-head closure. We can't borrow `target` mutably while
-    // also borrowing it via the closure, so we extract the model's
-    // apply_lm_head into a static-tensor-only form. For this test, the
-    // simplest path: clone the apply by holding a reference to a separately
-    // loaded `LlamaQuantDecoder` (or equivalently, since lm_head is a
-    // QMatMul that borrows its source data, we can reuse the same target).
-    //
-    // Since both the run loop and lm_head_apply need access to `target`,
-    // we use raw pointers carefully — but that's ugly. Cleaner: use a
-    // boxed FnMut that takes the hidden tensor and returns logits.
-
-    // Workaround for v0.2.0-1: separate decoder for the lm_head closure.
-    // (The published EAGLE implementation has the draft hold its own
-    // shared lm_head. We expose target's apply_lm_head; the closure
-    // captures a non-mutable reference. The run loop needs to re-borrow
-    // mutably, so we need to split state — this is a real borrow-checker
-    // dance documented in the eagle module's TODOs.)
-    //
-    // For now: re-use the GGUF path to load a SECOND quantized lm_head
-    // standalone is wasteful. Instead we use a reference cell trick OR
-    // factor the lm_head out. Simplest: a second LlamaQuantDecoder
-    // sharing the same files (cached) — wasteful but correct, and
-    // measures end-to-end shape + speedup correctness.
-
-    eprintln!("loading second LlamaQuant for lm_head_apply (workaround)...");
-    let lm_head_target = LlamaQuantDecoder::from_gguf(
-        &gguf_path,
-        &tokenizer_path,
-        device.clone(),
-        LLAMA3_EOS.to_vec(),
-    )
-    .expect("LlamaQuantDecoder::from_gguf (lm_head)");
-
     let t1 = std::time::Instant::now();
     let med_out = run_eagle(
         &mut target,
         &mut draft,
-        |hidden| lm_head_target.apply_lm_head(hidden),
         &prompt_ids,
         n,
         &run_cfg,

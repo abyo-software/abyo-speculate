@@ -229,6 +229,10 @@ impl TreeDecoder for LlamaQuantDecoder {
     fn tree_logits(&mut self, tree: &DraftTree) -> Result<Vec<Vec<f32>>> {
         LlamaQuantDecoder::tree_logits(self, tree)
     }
+
+    fn apply_lm_head(&self, hidden: &Tensor) -> Result<Tensor> {
+        LlamaQuantDecoder::apply_lm_head(self, hidden)
+    }
 }
 
 impl Decoder for LlamaQuantDecoder {
