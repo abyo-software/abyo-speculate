@@ -33,6 +33,7 @@ dependencies = [
  "candle-core",
  "clap",
  "indicatif",
+ "rand 0.8.6",
  "serde",
  "serde_json",
  "tokio",

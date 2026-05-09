@@ -209,11 +209,18 @@ where
             commits.push(bonus);
         }
 
-        // 5. Re-anchor both decoders to the committed prefix.
-        target.rollback_to(pre_target_len)?;
-        target.observe(&commits)?;
-        draft.rollback_to(pre_draft_len)?;
-        draft.observe(&commits)?;
+        // 5. Re-anchor both decoders to the committed prefix. Both already
+        //    have the original `k` drafts in their KV cache from steps 1–2;
+        //    `commits[..accepted_count]` matches the cached prefix exactly
+        //    (the rejected draft, if any, was *replaced* — the kept drafts
+        //    are the originals). So we truncate to that point and only
+        //    forward the suffix (replacement on rejection, bonus on full
+        //    acceptance, or nothing if all-accepted-no-bonus).
+        let accepted_count = commits.len().min(k);
+        target.rollback_to(pre_target_len + accepted_count)?;
+        target.observe(&commits[accepted_count..])?;
+        draft.rollback_to(pre_draft_len + accepted_count)?;
+        draft.observe(&commits[accepted_count..])?;
 
         generated.extend_from_slice(&commits);
     }

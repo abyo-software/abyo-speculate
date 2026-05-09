@@ -24,6 +24,7 @@ abyo-speculate = { path = "../speculate" }
 candle-core = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
+rand = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
