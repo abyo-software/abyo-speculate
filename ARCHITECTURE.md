@@ -24,10 +24,11 @@ abyo-speculate/
 │   │   │   ├── cache/
 │   │   │   │   ├── mod.rs
 │   │   │   │   └── rollback.rs    # snapshot / append / commit / rollback
-│   │   │   ├── tree.rs            # DraftTree (Medusa / EAGLE shared)
+│   │   │   ├── tree.rs            # DraftTree + tensor mask builders
 │   │   │   ├── methods/
 │   │   │   │   ├── mod.rs         # Method enum
-│   │   │   │   └── vanilla.rs     # Leviathan SD reference impl
+│   │   │   │   ├── vanilla.rs     # Leviathan SD reference impl
+│   │   │   │   └── medusa.rs      # Cai 2024 reference impl + skeleton
 │   │   │   └── model/
 │   │   │       ├── mod.rs         # Decoder trait
 │   │   │       ├── loader.rs      # ModelSource (HF id / local path)
@@ -165,7 +166,7 @@ will route Qwen2's per-layer KV through `RollbackCache`. Until then,
 real-model SD is correct but does not yet beat plain autoregressive on
 wall-clock.
 
-## Tree primitives (Phase 2a foundation)
+## Tree primitives (Phase 2a)
 
 `tree::DraftTree` is a parent-pointer representation used by Medusa and
 EAGLE. It exposes:
@@ -177,10 +178,59 @@ EAGLE. It exposes:
 - `paths()` / `path_to(idx)` — root-to-leaf chains, used to commit a
   selected branch.
 
-This module is **tensor-free on purpose**. The Phase 2 model-side glue
-turns `attention_mask_bool` into a `[1, 1, n, n]` `f32` bias added to
-attention logits inside the model's forward pass. That glue lives in the
-concrete decoder (Qwen2 first, then Llama).
+The tensor-side glue (Phase 2a tensor builders) is also in this module:
+
+- `tree_self_bias(device, dtype)` — `[n, n]` additive bias (`0.0` /
+  `-inf`) for self-attention among tree nodes.
+- `full_attention_bias(prefix_len, device, dtype)` — `[n, prefix_len + n]`
+  bias covering the committed prefix (all-attend) plus the tree.
+- `full_attention_bias_4d(prefix_len, batch, head_dim_size, ...)` — the
+  same expanded to `[b, h, n, prefix_len + n]` ready to drop into a
+  candle attention layer.
+
+> **Wiring into Qwen2 still requires a vendored model.** candle's
+> `qwen2::Model::forward` accepts an `attn_mask` argument but its
+> `prepare_attention_mask` only handles padding masks shaped `[b, seq]`,
+> not the full `[b, 1, n, prefix_len + n]` bias we need. Phase 1c will
+> vendor `qwen2.rs` into `model/qwen2_local.rs` so we can inject our mask
+> directly. Until then, the tensor builders are tested standalone.
+
+## Medusa primitives (Phase 1b)
+
+`methods::medusa` is the multi-head SD path. Phase 1b ships:
+
+- `MedusaConfig` / `MedusaHead` / `MedusaHeads` — structural metadata.
+  The released vicuna-7b heads have `n_heads=4, hidden_size=4096`; that
+  preset lives on `MedusaConfig::vicuna_7b_defaults`.
+- `MedusaHeads::build_draft_tree(committed_root, head_top_k, topology)`
+  with two topologies:
+  - `Greedy` — each head's top-1 forms a linear chain (== vanilla SD).
+  - `CartesianProduct` — every (cand_0, cand_1, ..., cand_{N-1})
+    combination becomes a path.
+- `top_k_indices(logits, k)` — stable-tie-break top-k helper.
+- `run_medusa(target, heads, head_draft_fn, prompt, max_tokens, config)`
+  — the reference loop (mirrors `vanilla::run_vanilla_sd`):
+  1. Ask `head_draft_fn` for per-head top-`k` candidates.
+  2. Build a `DraftTree`.
+  3. For each tree node, fetch the target's next-token distribution
+     given the path root→node (single forward in real Medusa; one
+     observe+rollback per path in the mock reference).
+  4. Walk every root-to-leaf path; greedily accept tokens while the
+     `Acceptance` rule passes.
+  5. Commit the longest accepted prefix + a bonus token from the
+     deepest accepted node's distribution.
+- Two acceptance rules supported:
+  - `Acceptance::Greedy` — `argmax(p_target) == draft_token`.
+  - `Acceptance::Typical { epsilon, delta }` — Cai §3.2:
+    `accept iff p_target(x) >= max(epsilon, delta * exp(-H(p_target)))`.
+
+What is **not** here yet (deliberately):
+- The `Decoder` impl that runs a real target through Medusa heads (residual
+  MLP + projection). Needs the head weights from a published checkpoint.
+- HF download / loader for those checkpoints.
+- Engine wiring — `engine.generate_tokens(... Method::Medusa)` still
+  returns `UnsupportedMethod`. The plumbing change is mechanical once the
+  loader lands.
 
 ## The `SpeculateEngine` façade
 
@@ -209,14 +259,14 @@ deferred to Phase 1c.**
 
 | Phase | Item | Why deferred |
 |-------|------|--------------|
-| 1c | Wire `RollbackCache` into `Qwen2Decoder` | Need the full SD verify path before optimisation matters |
+| 1c | Vendor `qwen2.rs` to inject our tree-attention bias | candle's stock model only accepts padding masks |
+| 1c | Wire `RollbackCache` into `Qwen2Decoder` | Currently uses `clear+replay`; needs vendored model first |
 | 1c | `Backend` trait wrapping decoder + tokenizer | Wait until we have ≥2 model families to see the right shape |
-| 1b | Medusa multi-head | Requires loading published Medusa heads; needs HF download helper |
-| 2a | Tree-attention tensor glue | Wire `tree::DraftTree::attention_mask_bool` into a Qwen2 attention bias |
+| 1b | Real Medusa head `Decoder` (residual MLP + projection forward) | Needs HF checkpoint loader; the structural glue + reference loop are landed |
+| 1b | HF-hub model + Medusa-head download helper | Trivial to add when first needed |
 | 2b | EAGLE-2 dynamic tree construction | Research-grade implementation; needs careful study of the paper |
 | 2c | EAGLE-3 multi-layer features | Builds on 2b |
 | 3 | SAGUARO | Paper not yet verified (see plan §14 checklist) |
-| n/a | HF-hub model download helper | Trivial to add when first needed |
 | n/a | Real-GPU benchmarks | Needs the GPU restored + EAGLE-3 head HF availability |
 
 ## Testing strategy

@@ -3,8 +3,8 @@
 //! Each method exposes the same `Decoder` trait so the [`crate::SpeculateEngine`]
 //! can dispatch generically.
 
+pub mod medusa;
 pub mod vanilla;
-// pub mod medusa;  // Phase 1b
 // pub mod eagle2;  // Phase 2b
 // pub mod eagle3;  // Phase 2c
 

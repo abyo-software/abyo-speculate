@@ -27,6 +27,7 @@
 #![allow(clippy::needless_range_loop)]
 
 use crate::{Error, Result};
+use candle_core::{DType, Device, Tensor};
 
 /// A draft tree rooted at a single (already-committed) token.
 ///
@@ -180,6 +181,106 @@ impl DraftTree {
         chain.reverse();
         chain
     }
+
+    /// Build the tree-self attention bias as a candle tensor.
+    ///
+    /// Shape: `[n, n]` where `n = self.len()`. `0.0` at `[i, j]` means node
+    /// `i` may attend to `j`, `-inf` means it may not. This is the additive
+    /// form expected by attention layers (logits + bias before softmax).
+    ///
+    /// Use [`Self::full_attention_bias`] when integrating with a model that
+    /// expects a `[n, prefix_len + n]` mask covering the committed prefix +
+    /// the tree positions.
+    pub fn tree_self_bias(&self, device: &Device, dtype: DType) -> Result<Tensor> {
+        let n = self.len();
+        let mut data = vec![0f32; n * n];
+        for i in 0..n {
+            for j in 0..n {
+                let allowed = self.is_ancestor_of(j, i);
+                if !allowed {
+                    data[i * n + j] = f32::NEG_INFINITY;
+                }
+            }
+        }
+        let t = Tensor::from_slice(&data, (n, n), device).map_err(Error::Candle)?;
+        if dtype != DType::F32 {
+            t.to_dtype(dtype).map_err(Error::Candle)
+        } else {
+            Ok(t)
+        }
+    }
+
+    /// Build the full attention bias for the tree positions over a committed
+    /// prefix.
+    ///
+    /// Shape: `[n, prefix_len + n]`. The first `prefix_len` columns are all
+    /// `0.0` (every tree node attends to the entire committed prefix
+    /// unconditionally). The trailing `[n, n]` block is the tree-self bias
+    /// from [`Self::tree_self_bias`].
+    pub fn full_attention_bias(
+        &self,
+        prefix_len: usize,
+        device: &Device,
+        dtype: DType,
+    ) -> Result<Tensor> {
+        let n = self.len();
+        let total = prefix_len + n;
+        let mut data = vec![0f32; n * total];
+        for i in 0..n {
+            // Prefix columns: 0.0 (already initialized).
+            // Tree-self columns:
+            for j in 0..n {
+                if !self.is_ancestor_of(j, i) {
+                    data[i * total + prefix_len + j] = f32::NEG_INFINITY;
+                }
+            }
+        }
+        let t = Tensor::from_slice(&data, (n, total), device).map_err(Error::Candle)?;
+        if dtype != DType::F32 {
+            t.to_dtype(dtype).map_err(Error::Candle)
+        } else {
+            Ok(t)
+        }
+    }
+
+    /// Convenience: expand the `[n, prefix_len + n]` bias to the
+    /// `[batch, heads_or_one, n, prefix_len + n]` shape that most attention
+    /// implementations expect to broadcast against per-head logits.
+    ///
+    /// `head_dim_size = 1` is the usual choice (broadcast across heads). Pass
+    /// a positive value to materialize the full per-head copy if your
+    /// integration needs it.
+    pub fn full_attention_bias_4d(
+        &self,
+        prefix_len: usize,
+        batch: usize,
+        head_dim_size: usize,
+        device: &Device,
+        dtype: DType,
+    ) -> Result<Tensor> {
+        let bias = self.full_attention_bias(prefix_len, device, dtype)?;
+        let n = self.len();
+        bias.reshape((1, 1, n, prefix_len + n))
+            .and_then(|t| t.expand((batch, head_dim_size, n, prefix_len + n)))
+            .map_err(Error::Candle)
+    }
+
+    /// Whether `ancestor_idx` is on the path from the root to `node_idx`
+    /// (inclusive: `i` is its own ancestor).
+    fn is_ancestor_of(&self, ancestor_idx: usize, node_idx: usize) -> bool {
+        let mut cur = node_idx;
+        if cur == ancestor_idx {
+            return true;
+        }
+        while cur != 0 {
+            cur = self.parents[cur];
+            if cur == ancestor_idx {
+                return true;
+            }
+        }
+        // Reached root (index 0) — only true if ancestor_idx is the root.
+        ancestor_idx == 0
+    }
 }
 
 #[cfg(test)]
@@ -277,5 +378,108 @@ mod tests {
     fn path_to_walks_root_first() {
         let t = DraftTree::from_parent_table(&[(0, 0), (0, 1), (1, 2), (2, 3)]).unwrap();
         assert_eq!(t.path_to(3), vec![0, 1, 2, 3]);
+    }
+
+    // ======================================================================
+    // Tensor-bias tests — Phase 2a tensor glue.
+    // ======================================================================
+
+    #[test]
+    fn tree_self_bias_linear_is_lower_triangular() {
+        let t = DraftTree::linear(0, &[1, 2, 3]);
+        let dev = Device::Cpu;
+        let bias = t.tree_self_bias(&dev, DType::F32).unwrap();
+        let v = bias.to_vec2::<f32>().unwrap();
+        for i in 0..4 {
+            for j in 0..4 {
+                if j <= i {
+                    assert_eq!(v[i][j], 0.0, "expected 0 at allowed ({i},{j})");
+                } else {
+                    assert!(v[i][j].is_infinite() && v[i][j].is_sign_negative());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn tree_self_bias_branching_blocks_siblings() {
+        // Same shape as branching_tree_paths.
+        let t =
+            DraftTree::from_parent_table(&[(0, 100), (0, 11), (0, 12), (1, 23), (1, 24), (2, 35)])
+                .unwrap();
+        let bias = t.tree_self_bias(&Device::Cpu, DType::F32).unwrap();
+        let v = bias.to_vec2::<f32>().unwrap();
+
+        // Node 3 attends to {0, 1, 3}; everything else is masked.
+        for j in 0..6 {
+            let allowed = matches!(j, 0 | 1 | 3);
+            if allowed {
+                assert_eq!(v[3][j], 0.0, "node 3 should attend to {j}");
+            } else {
+                assert!(
+                    v[3][j].is_infinite() && v[3][j].is_sign_negative(),
+                    "node 3 should NOT attend to {j}"
+                );
+            }
+        }
+        // Node 5 attends to {0, 2, 5}.
+        for j in 0..6 {
+            let allowed = matches!(j, 0 | 2 | 5);
+            if allowed {
+                assert_eq!(v[5][j], 0.0, "node 5 should attend to {j}");
+            } else {
+                assert!(v[5][j].is_infinite() && v[5][j].is_sign_negative());
+            }
+        }
+    }
+
+    #[test]
+    fn full_attention_bias_keeps_prefix_unmasked() {
+        let t = DraftTree::linear(0, &[1, 2]);
+        let bias = t.full_attention_bias(5, &Device::Cpu, DType::F32).unwrap();
+        assert_eq!(bias.dims(), &[3, 5 + 3]);
+        let v = bias.to_vec2::<f32>().unwrap();
+        // Prefix columns (0..5) should be all zero for every tree row.
+        for i in 0..3 {
+            for j in 0..5 {
+                assert_eq!(v[i][j], 0.0, "prefix col {j} for tree row {i}");
+            }
+        }
+        // Tree columns: causal pattern (because linear tree).
+        for i in 0..3 {
+            for j in 0..3 {
+                let v_ij = v[i][5 + j];
+                if j <= i {
+                    assert_eq!(v_ij, 0.0);
+                } else {
+                    assert!(v_ij.is_infinite() && v_ij.is_sign_negative());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn full_attention_bias_4d_has_expected_shape() {
+        let t = DraftTree::linear(0, &[1, 2, 3]);
+        let bias = t
+            .full_attention_bias_4d(7, 1, 1, &Device::Cpu, DType::F32)
+            .unwrap();
+        assert_eq!(bias.dims(), &[1, 1, 4, 7 + 4]);
+    }
+
+    #[test]
+    fn full_attention_bias_4d_broadcasts_to_heads() {
+        let t = DraftTree::linear(0, &[1, 2]);
+        let bias = t
+            .full_attention_bias_4d(0, 2, 4, &Device::Cpu, DType::F32)
+            .unwrap();
+        assert_eq!(bias.dims(), &[2, 4, 3, 3]);
+    }
+
+    #[test]
+    fn tree_self_bias_dtype_conversion() {
+        let t = DraftTree::linear(0, &[1, 2]);
+        let bias_f16 = t.tree_self_bias(&Device::Cpu, DType::F16).unwrap();
+        assert_eq!(bias_f16.dtype(), DType::F16);
     }
 }
