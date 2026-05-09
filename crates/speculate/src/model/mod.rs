@@ -91,6 +91,14 @@ pub trait Decoder {
             reason: "this decoder has no bundled tokenizer".into(),
         })
     }
+
+    /// EOS / stop token ids for this decoder (e.g. `</s>`, `<|im_end|>`).
+    /// Default empty — implementations that know their EOS override this so
+    /// engine-level [`generate`](crate::SpeculateEngine::generate) can stop
+    /// at the natural end of a response.
+    fn eos_token_ids(&self) -> Vec<u32> {
+        Vec::new()
+    }
 }
 
 /// Capability trait for decoders that support tree-attention SD methods

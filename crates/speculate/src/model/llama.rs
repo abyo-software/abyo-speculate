@@ -34,6 +34,7 @@ pub struct LlamaDecoder {
     dtype: DType,
     vocab_size: usize,
     hidden_size: usize,
+    eos_token_ids: Vec<u32>,
     cache_len: usize,
 }
 
@@ -77,6 +78,12 @@ impl LlamaDecoder {
         let tokenizer = Tokenizer::from_file(tokenizer_path.as_ref())
             .map_err(|e| Error::Tokenizer(e.to_string()))?;
 
+        let eos_token_ids = match &config.eos_token_id {
+            Some(crate::model::llama_local::LlamaEosToks::Single(id)) => vec![*id],
+            Some(crate::model::llama_local::LlamaEosToks::Multiple(v)) => v.clone(),
+            None => Vec::new(),
+        };
+
         Ok(Self {
             model,
             cache,
@@ -87,6 +94,7 @@ impl LlamaDecoder {
             dtype,
             vocab_size: config.vocab_size,
             hidden_size: config.hidden_size,
+            eos_token_ids,
             cache_len: 0,
         })
     }
@@ -238,6 +246,10 @@ impl Decoder for LlamaDecoder {
 
     fn decode(&self, ids: &[u32], skip_special_tokens: bool) -> Result<String> {
         LlamaDecoder::decode(self, ids, skip_special_tokens)
+    }
+
+    fn eos_token_ids(&self) -> Vec<u32> {
+        self.eos_token_ids.clone()
     }
 
     fn vocab_size(&self) -> usize {

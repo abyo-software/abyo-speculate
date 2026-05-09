@@ -39,6 +39,7 @@ pub struct Qwen2Decoder {
     dtype: DType,
     vocab_size: usize,
     hidden_size: usize,
+    eos_token_ids: Vec<u32>,
     /// Mirrors `model.kv_cache_len()`. Maintained explicitly so we can avoid
     /// querying the model on hot paths.
     cache_len: usize,
@@ -91,6 +92,12 @@ impl Qwen2Decoder {
         let tokenizer = Tokenizer::from_file(tokenizer_path.as_ref())
             .map_err(|e| Error::Tokenizer(e.to_string()))?;
 
+        let eos_token_ids = config
+            .eos_token_id
+            .as_ref()
+            .map(|e| e.as_vec())
+            .unwrap_or_default();
+
         Ok(Self {
             model,
             lm_head,
@@ -100,6 +107,7 @@ impl Qwen2Decoder {
             dtype,
             vocab_size: config.vocab_size,
             hidden_size: config.hidden_size,
+            eos_token_ids,
             cache_len: 0,
         })
     }
@@ -292,6 +300,10 @@ impl Decoder for Qwen2Decoder {
 
     fn decode(&self, ids: &[u32], skip_special_tokens: bool) -> Result<String> {
         Qwen2Decoder::decode(self, ids, skip_special_tokens)
+    }
+
+    fn eos_token_ids(&self) -> Vec<u32> {
+        self.eos_token_ids.clone()
     }
 
     fn vocab_size(&self) -> usize {

@@ -243,6 +243,134 @@ pub fn run_vanilla_sd_with_mock<R: rand::Rng>(
     run_vanilla_sd(target, draft, prompt, max_new_tokens, config, rng)
 }
 
+/// [`run_vanilla_sd`] with EOS / stop_tokens + per-token callback.
+///
+/// Wrapper layout: `run_vanilla_sd` is the simplest API for callers that
+/// just want a fixed token count; this is the powerful version used by
+/// [`crate::SpeculateEngine::generate_tokens_with`] for streaming and EOS
+/// handling.
+pub fn run_vanilla_sd_with<T, D, R, F>(
+    target: &mut T,
+    draft: &mut D,
+    prompt: &[u32],
+    opts: &crate::engine::GenerationOptions,
+    config: &VanillaConfig,
+    rng: &mut R,
+    mut on_token: F,
+) -> Result<Vec<u32>>
+where
+    T: crate::model::Decoder + ?Sized,
+    D: crate::model::Decoder + ?Sized,
+    R: rand::Rng + ?Sized,
+    F: FnMut(u32) -> bool,
+{
+    use crate::sampling::{sample_from_distribution, softmax_with_temperature};
+
+    if target.vocab_size() != draft.vocab_size() {
+        return Err(crate::Error::Sampling(format!(
+            "target vocab {} != draft vocab {}",
+            target.vocab_size(),
+            draft.vocab_size()
+        )));
+    }
+
+    target.reset();
+    draft.reset();
+    target.observe(prompt)?;
+    draft.observe(prompt)?;
+
+    let max_new_tokens = opts.max_new_tokens;
+    let mut generated: Vec<u32> = Vec::with_capacity(max_new_tokens);
+
+    'rounds: while generated.len() < max_new_tokens {
+        let remaining = max_new_tokens - generated.len();
+        let k = config.draft_lookahead.min(remaining);
+        if k == 0 {
+            break;
+        }
+
+        let pre_target_len = target.history_len();
+        let pre_draft_len = draft.history_len();
+
+        // 1. Draft k tokens.
+        let mut draft_tokens: Vec<u32> = Vec::with_capacity(k);
+        let mut draft_dists: Vec<Vec<f32>> = Vec::with_capacity(k);
+        for _ in 0..k {
+            let logits = draft.next_logits()?;
+            let probs = softmax_with_temperature(&logits, config.temperature)?;
+            let tok = sample_from_distribution(rng, &probs)? as u32;
+            draft_tokens.push(tok);
+            draft_dists.push(probs);
+            draft.observe(&[tok])?;
+        }
+
+        // 2. Target's parallel verification.
+        let target_batched = target.batched_logits(&draft_tokens)?;
+        debug_assert_eq!(target_batched.len(), k + 1);
+
+        // 3. Walk through draft positions; build commits.
+        let mut commits: Vec<u32> = Vec::with_capacity(k + 1);
+        let mut rejected = false;
+        for i in 0..k {
+            let p_probs = softmax_with_temperature(&target_batched[i], config.temperature)?;
+            let q_probs = &draft_dists[i];
+            let token = draft_tokens[i] as usize;
+            let p = p_probs[token];
+            let q = q_probs[token];
+            let u: f32 = rng.gen();
+            match modified_rejection_step(q, p, u) {
+                AcceptOutcome::Accepted => {
+                    commits.push(draft_tokens[i]);
+                    if generated.len() + commits.len() >= max_new_tokens {
+                        break;
+                    }
+                }
+                AcceptOutcome::Rejected => {
+                    let adj = adjusted_distribution(&p_probs, q_probs)?;
+                    let new_tok = sample_from_distribution(rng, &adj)? as u32;
+                    commits.push(new_tok);
+                    rejected = true;
+                    break;
+                }
+            }
+        }
+
+        // 4. Bonus token.
+        if !rejected && commits.len() == k && generated.len() + commits.len() < max_new_tokens {
+            let p_probs = softmax_with_temperature(&target_batched[k], config.temperature)?;
+            let bonus = sample_from_distribution(rng, &p_probs)? as u32;
+            commits.push(bonus);
+        }
+
+        // 5. Re-anchor decoders. Walk commits looking for stop conditions; if
+        //    we hit one, only commit up through that token.
+        let mut early_stop_at: Option<usize> = None;
+        for (i, &tok) in commits.iter().enumerate() {
+            if !on_token(tok) || opts.stop_tokens.contains(&tok) {
+                early_stop_at = Some(i + 1);
+                break;
+            }
+        }
+        if let Some(stop_at) = early_stop_at {
+            commits.truncate(stop_at);
+        }
+
+        let accepted_count = commits.len().min(k);
+        target.rollback_to(pre_target_len + accepted_count)?;
+        target.observe(&commits[accepted_count..])?;
+        draft.rollback_to(pre_draft_len + accepted_count)?;
+        draft.observe(&commits[accepted_count..])?;
+
+        generated.extend_from_slice(&commits);
+
+        if early_stop_at.is_some() {
+            break 'rounds;
+        }
+    }
+
+    Ok(generated)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

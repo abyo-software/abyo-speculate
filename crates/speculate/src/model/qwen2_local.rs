@@ -45,6 +45,26 @@ use candle_core::{DType, Device, Module, Result, Tensor, D};
 use candle_nn::{linear, linear_no_bias, rms_norm, Activation, Linear, RmsNorm, VarBuilder};
 use std::sync::Arc;
 
+/// Either a single EOS id or a list. HF Qwen2 configs use either form.
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+#[serde(untagged)]
+pub enum Qwen2EosToks {
+    /// Legacy single id.
+    Single(u32),
+    /// Multi-token EOS (Qwen2.5 ships `[151645, 151643]` so chat-end +
+    /// document-end both terminate generation).
+    Multi(Vec<u32>),
+}
+
+impl Qwen2EosToks {
+    pub fn as_vec(&self) -> Vec<u32> {
+        match self {
+            Qwen2EosToks::Single(id) => vec![*id],
+            Qwen2EosToks::Multi(v) => v.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
 pub struct Config {
     pub vocab_size: usize,
@@ -61,6 +81,9 @@ pub struct Config {
     pub rms_norm_eps: f64,
     pub use_sliding_window: bool,
     pub hidden_act: Activation,
+    /// Optional EOS token id(s). HF configs may omit this; default = no EOS.
+    #[serde(default)]
+    pub eos_token_id: Option<Qwen2EosToks>,
 }
 
 #[derive(Debug, Clone)]

@@ -40,6 +40,41 @@ impl std::fmt::Debug for SpeculateEngine {
     }
 }
 
+/// Per-call generation options. Bundled separately from [`EngineConfig`]
+/// because they're typically the things a caller varies between calls
+/// (max_tokens, stop tokens, callback) while sampling settings live on the
+/// engine.
+#[derive(Debug, Clone, Default)]
+pub struct GenerationOptions {
+    /// Maximum new tokens to emit (excluding the prompt).
+    pub max_new_tokens: usize,
+    /// Token ids that, when emitted, terminate generation. The terminating
+    /// token *is* included in the returned token vector. Empty = no stop.
+    pub stop_tokens: Vec<u32>,
+}
+
+impl GenerationOptions {
+    /// Convenience: `max_new_tokens` only, no stop tokens.
+    pub fn new(max_new_tokens: usize) -> Self {
+        Self {
+            max_new_tokens,
+            stop_tokens: Vec::new(),
+        }
+    }
+
+    /// Add a stop token (chainable).
+    pub fn with_stop(mut self, tok: u32) -> Self {
+        self.stop_tokens.push(tok);
+        self
+    }
+
+    /// Set stop tokens en bloc (chainable).
+    pub fn with_stops(mut self, toks: Vec<u32>) -> Self {
+        self.stop_tokens = toks;
+        self
+    }
+}
+
 /// Resolved configuration for a fully-built engine.
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
@@ -112,11 +147,31 @@ impl SpeculateEngine {
         true
     }
 
-    /// Generate `max_new_tokens` from a token-id prompt.
-    ///
-    /// Lower-level than [`Self::generate`]; useful when you already have a
-    /// tokenized prompt or want to keep tokenization out of this crate.
+    /// Generate `max_new_tokens` from a token-id prompt. Convenience wrapper
+    /// over [`Self::generate_tokens_with`] with default options + a no-op
+    /// callback.
     pub fn generate_tokens(&mut self, prompt: &[u32], max_new_tokens: usize) -> Result<Vec<u32>> {
+        self.generate_tokens_with(prompt, &GenerationOptions::new(max_new_tokens), |_| true)
+    }
+
+    /// Generate from a token-id prompt with full control: per-call
+    /// [`GenerationOptions`] (max tokens, stop tokens) and a streaming
+    /// callback `on_token` invoked once per emitted token.
+    ///
+    /// `on_token` returns `true` to continue generation, `false` to stop
+    /// after the current token. Stop tokens in `opts` produce the same
+    /// behaviour. The terminating token (whether from `on_token` returning
+    /// `false` or from a stop-tokens hit) *is* included in the returned
+    /// `Vec<u32>`.
+    pub fn generate_tokens_with<F>(
+        &mut self,
+        prompt: &[u32],
+        opts: &GenerationOptions,
+        on_token: F,
+    ) -> Result<Vec<u32>>
+    where
+        F: FnMut(u32) -> bool,
+    {
         if !self.is_ready() {
             return Err(Error::MissingField(
                 "models not loaded — call with_target / with_draft first",
@@ -135,9 +190,10 @@ impl SpeculateEngine {
                 run_autoregressive(
                     target.as_mut(),
                     prompt,
-                    max_new_tokens,
+                    opts,
                     &self.config,
                     &mut rng,
+                    on_token,
                 )
             }
             Method::Vanilla => {
@@ -148,13 +204,14 @@ impl SpeculateEngine {
                     temperature: self.config.temperature,
                     top_p: self.config.top_p,
                 };
-                crate::methods::vanilla::run_vanilla_sd(
+                crate::methods::vanilla::run_vanilla_sd_with(
                     target.as_mut(),
                     draft.as_mut(),
                     prompt,
-                    max_new_tokens,
+                    opts,
                     &cfg,
                     &mut rng,
+                    on_token,
                 )
             }
             other => Err(Error::UnsupportedMethod {
@@ -166,12 +223,12 @@ impl SpeculateEngine {
 
     /// Friendly text-in / text-out wrapper.
     ///
-    /// Tokenizes via the target decoder's bundled tokenizer, runs
-    /// [`Self::generate_tokens`], detokenizes the output. Errors with
-    /// [`Error::MissingField`] if no target is attached or
-    /// [`Error::UnsupportedMethod`] if the attached target has no tokenizer
-    /// (e.g. a mock decoder used in tests — call `generate_tokens` directly
-    /// for those).
+    /// Tokenizes via the target decoder's bundled tokenizer, generates with
+    /// the target's own EOS tokens as stop conditions, detokenizes the
+    /// output. Errors with [`Error::MissingField`] if no target is attached
+    /// or [`Error::UnsupportedMethod`] if the attached target has no
+    /// tokenizer (e.g. a mock decoder used in tests — call
+    /// [`Self::generate_tokens`] directly for those).
     pub fn generate(&mut self, prompt: &str, max_tokens: usize) -> Result<String> {
         if !self.is_ready() {
             return Err(Error::MissingField(
@@ -180,7 +237,9 @@ impl SpeculateEngine {
         }
         let target = self.target.as_ref().unwrap();
         let prompt_ids = target.encode(prompt, true)?;
-        let out_ids = self.generate_tokens(&prompt_ids, max_tokens)?;
+        let stops = target.eos_token_ids();
+        let opts = GenerationOptions::new(max_tokens).with_stops(stops);
+        let out_ids = self.generate_tokens_with(&prompt_ids, &opts, |_| true)?;
         let target = self.target.as_ref().unwrap();
         target.decode(&out_ids, true)
     }
@@ -188,17 +247,18 @@ impl SpeculateEngine {
 
 /// Plain autoregressive generation: sample from `target.next_logits` one token
 /// at a time. Used as the `Method::Autoregressive` baseline.
-fn run_autoregressive<R: rand::Rng>(
+fn run_autoregressive<R: rand::Rng + ?Sized, F: FnMut(u32) -> bool>(
     target: &mut dyn Decoder,
     prompt: &[u32],
-    max_new_tokens: usize,
+    opts: &GenerationOptions,
     config: &EngineConfig,
     rng: &mut R,
+    mut on_token: F,
 ) -> Result<Vec<u32>> {
     target.reset();
     target.observe(prompt)?;
-    let mut out = Vec::with_capacity(max_new_tokens);
-    for _ in 0..max_new_tokens {
+    let mut out = Vec::with_capacity(opts.max_new_tokens);
+    for _ in 0..opts.max_new_tokens {
         let logits = target.next_logits()?;
         let mut probs = softmax_with_temperature(&logits, config.temperature)?;
         if config.top_p < 1.0 {
@@ -207,6 +267,9 @@ fn run_autoregressive<R: rand::Rng>(
         let tok = sample_from_distribution(rng, &probs)? as u32;
         target.observe(&[tok])?;
         out.push(tok);
+        if !on_token(tok) || opts.stop_tokens.contains(&tok) {
+            break;
+        }
     }
     Ok(out)
 }
@@ -402,6 +465,100 @@ mod tests {
 
         let out = engine.generate_tokens(&[1u32], 12).unwrap();
         assert_eq!(out.len(), 12);
+    }
+
+    #[test]
+    fn generate_tokens_with_stops_at_stop_token() {
+        // Mock target peaked at token 5. With stop_tokens = [5], the very
+        // first emitted token terminates generation.
+        let mut probs = vec![0.0f32; 8];
+        probs[5] = 1.0;
+        let target = fixed_distribution(probs);
+        let mut engine = SpeculateEngineBuilder::default()
+            .target_model("dummy")
+            .method(Method::Autoregressive)
+            .seed(1)
+            .build()
+            .unwrap()
+            .with_target(target);
+
+        let opts = GenerationOptions::new(64).with_stop(5);
+        let out = engine
+            .generate_tokens_with(&[0u32], &opts, |_| true)
+            .unwrap();
+        assert_eq!(out, vec![5], "should stop after first emitted EOS");
+    }
+
+    #[test]
+    fn generate_tokens_with_callback_can_halt_early() {
+        let target = fixed_distribution(vec![0.0, 0.0, 1.0, 0.0]);
+        let mut engine = SpeculateEngineBuilder::default()
+            .target_model("dummy")
+            .method(Method::Autoregressive)
+            .seed(1)
+            .build()
+            .unwrap()
+            .with_target(target);
+
+        let mut count = 0;
+        let opts = GenerationOptions::new(100);
+        let out = engine
+            .generate_tokens_with(&[0u32], &opts, |_| {
+                count += 1;
+                count < 5
+            })
+            .unwrap();
+        assert_eq!(out.len(), 5, "callback should stop after 5 tokens");
+    }
+
+    #[test]
+    fn generate_tokens_with_callback_streams_each_token() {
+        // Verify callback fires once per emitted token, in order.
+        let target = fixed_distribution(vec![0.0, 0.0, 1.0, 0.0]);
+        let mut engine = SpeculateEngineBuilder::default()
+            .target_model("dummy")
+            .method(Method::Autoregressive)
+            .seed(1)
+            .build()
+            .unwrap()
+            .with_target(target);
+
+        let mut seen = Vec::new();
+        let opts = GenerationOptions::new(7);
+        let out = engine
+            .generate_tokens_with(&[0u32], &opts, |t| {
+                seen.push(t);
+                true
+            })
+            .unwrap();
+        assert_eq!(seen, out, "callback sequence should match returned tokens");
+        assert_eq!(out.len(), 7);
+    }
+
+    #[test]
+    fn vanilla_sd_with_options_respects_stop_tokens() {
+        // Both target and draft peaked at token 5. Stop on 5 → 1 token only.
+        let mut probs = vec![0.0f32; 8];
+        probs[5] = 1.0;
+        let target = fixed_distribution(probs.clone());
+        let draft = fixed_distribution(probs);
+        let mut engine = SpeculateEngineBuilder::default()
+            .target_model("dummy-target")
+            .draft_model("dummy-draft")
+            .method(Method::Vanilla)
+            .draft_lookahead(4)
+            .seed(99)
+            .build()
+            .unwrap()
+            .with_target(target)
+            .with_draft(draft);
+
+        let opts = GenerationOptions::new(64).with_stop(5);
+        let out = engine
+            .generate_tokens_with(&[1u32], &opts, |_| true)
+            .unwrap();
+        assert_eq!(out.len(), 1, "vanilla SD should stop at first EOS");
+        assert_eq!(out[0], 5);
     }
 
     #[test]
