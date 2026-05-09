@@ -11,14 +11,15 @@
 //! use abyo_speculate::{SpeculateEngine, Method};
 //!
 //! # fn main() -> anyhow::Result<()> {
-//! let engine = SpeculateEngine::builder()
+//! let mut engine = SpeculateEngine::builder()
 //!     .target_model("llama-3.1-8b-instruct")
 //!     .method(Method::Vanilla)
 //!     .draft_model("tinyllama-1.1b")
 //!     .build()?;
 //!
-//! let out = engine.generate("Hello", 64)?;
-//! println!("{}", out);
+//! // engine.with_target(...).with_draft(...) attach loaded models;
+//! // see model::qwen2::Qwen2Decoder for a concrete loader.
+//! let _tokens = engine.generate_tokens(&[1u32, 2, 3], 64)?;
 //! # Ok(())
 //! # }
 //! ```

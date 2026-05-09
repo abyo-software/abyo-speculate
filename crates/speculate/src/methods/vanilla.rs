@@ -126,9 +126,9 @@ pub fn run_vanilla_sd<T, D, R>(
     rng: &mut R,
 ) -> Result<Vec<u32>>
 where
-    T: crate::model::Decoder,
-    D: crate::model::Decoder,
-    R: rand::Rng,
+    T: crate::model::Decoder + ?Sized,
+    D: crate::model::Decoder + ?Sized,
+    R: rand::Rng + ?Sized,
 {
     use crate::sampling::{sample_from_distribution, softmax_with_temperature};
 

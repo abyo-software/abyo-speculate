@@ -23,7 +23,7 @@ struct Args {
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    let engine = SpeculateEngine::builder()
+    let mut engine = SpeculateEngine::builder()
         .target_model(&args.model)
         .method(Method::Autoregressive)
         .build()?;

@@ -89,7 +89,7 @@ fn main() -> Result<()> {
     if let Some(d) = args.draft.as_deref() {
         builder = builder.draft_model(d);
     }
-    let engine = builder.build()?;
+    let mut engine = builder.build()?;
 
     println!(
         "engine ready: method={} target={:?}",
