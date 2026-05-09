@@ -105,29 +105,45 @@ pub fn adjusted_distribution(p_target: &[f32], q_draft: &[f32]) -> Result<Vec<f3
     Ok(adj)
 }
 
-/// Run one full vanilla SD generation loop using a [`crate::model::mock::MockDecoder`]
-/// pair. This is the **correctness reference implementation**: every other SD
-/// path in the crate is unit-tested for distribution-matching against this loop
-/// (which is itself unit-tested against analytic distributions).
+/// Run one full vanilla SD generation loop over any pair of [`crate::model::Decoder`]s.
+///
+/// This is the **correctness reference implementation**: every other SD path in
+/// the crate is unit-tested for distribution-matching against this loop (which
+/// is itself unit-tested against analytic distributions, see this module's
+/// `tests/`).
 ///
 /// Algorithm: Leviathan et al. 2023, with the modified rejection rule
 /// `accept iff u <= min(1, p_target(x) / q_draft(x))` and a re-sample on
-/// rejection from `norm(max(0, p_target - q_draft))`.
-#[cfg(any(test, feature = "test-util"))]
-pub fn run_vanilla_sd_with_mock<R: rand::Rng>(
-    target: &mut crate::model::mock::MockDecoder,
-    draft: &mut crate::model::mock::MockDecoder,
+/// rejection from `norm(max(0, p_target - q_draft))`. After each verification
+/// round both decoders' histories end equal to the committed prefix, so the
+/// next round's `next_logits` / `batched_logits` calls see consistent state.
+pub fn run_vanilla_sd<T, D, R>(
+    target: &mut T,
+    draft: &mut D,
     prompt: &[u32],
     max_new_tokens: usize,
     config: &VanillaConfig,
     rng: &mut R,
-) -> Result<Vec<u32>> {
+) -> Result<Vec<u32>>
+where
+    T: crate::model::Decoder,
+    D: crate::model::Decoder,
+    R: rand::Rng,
+{
     use crate::sampling::{sample_from_distribution, softmax_with_temperature};
+
+    if target.vocab_size() != draft.vocab_size() {
+        return Err(crate::Error::Sampling(format!(
+            "target vocab {} != draft vocab {}",
+            target.vocab_size(),
+            draft.vocab_size()
+        )));
+    }
 
     target.reset();
     draft.reset();
-    target.observe(prompt);
-    draft.observe(prompt);
+    target.observe(prompt)?;
+    draft.observe(prompt)?;
 
     let mut generated: Vec<u32> = Vec::with_capacity(max_new_tokens);
 
@@ -138,25 +154,28 @@ pub fn run_vanilla_sd_with_mock<R: rand::Rng>(
             break;
         }
 
-        // 1. Draft k tokens autoregressively from the draft model.
+        let pre_target_len = target.history_len();
+        let pre_draft_len = draft.history_len();
+
+        // 1. Draft k tokens autoregressively.
         let mut draft_tokens: Vec<u32> = Vec::with_capacity(k);
         let mut draft_dists: Vec<Vec<f32>> = Vec::with_capacity(k);
         for _ in 0..k {
-            let logits = draft.next_logits();
+            let logits = draft.next_logits()?;
             let probs = softmax_with_temperature(&logits, config.temperature)?;
             let tok = sample_from_distribution(rng, &probs)? as u32;
             draft_tokens.push(tok);
             draft_dists.push(probs);
-            draft.observe(&[tok]);
+            draft.observe(&[tok])?;
         }
 
-        // 2. Target evaluates [committed, draft_1, ..., draft_k] in parallel.
-        // batched_logits returns k+1 logit vectors: one per prefix.
-        let target_batched = target.batched_logits(&draft_tokens);
+        // 2. Target's parallel verification — k+1 logit vectors. Per the
+        //    Decoder trait contract, this advances target's history by `k`.
+        let target_batched = target.batched_logits(&draft_tokens)?;
         debug_assert_eq!(target_batched.len(), k + 1);
 
-        // 3. Walk through each draft position, accept/reject.
-        let mut accepted_count = 0usize;
+        // 3. Walk through each draft position; build the committed prefix.
+        let mut commits: Vec<u32> = Vec::with_capacity(k + 1);
         let mut rejected = false;
         for i in 0..k {
             let p_probs = softmax_with_temperature(&target_batched[i], config.temperature)?;
@@ -167,41 +186,54 @@ pub fn run_vanilla_sd_with_mock<R: rand::Rng>(
             let u: f32 = rng.gen();
             match modified_rejection_step(q, p, u) {
                 AcceptOutcome::Accepted => {
-                    accepted_count += 1;
-                    target.observe(&[draft_tokens[i]]);
-                    generated.push(draft_tokens[i]);
-                    if generated.len() >= max_new_tokens {
+                    commits.push(draft_tokens[i]);
+                    if generated.len() + commits.len() >= max_new_tokens {
                         break;
                     }
                 }
                 AcceptOutcome::Rejected => {
                     let adj = adjusted_distribution(&p_probs, q_probs)?;
                     let new_tok = sample_from_distribution(rng, &adj)? as u32;
-                    target.observe(&[new_tok]);
-                    generated.push(new_tok);
+                    commits.push(new_tok);
                     rejected = true;
                     break;
                 }
             }
         }
 
-        // 4. If all k draft tokens accepted, sample the bonus token from
-        //    target_batched[k] (the distribution after the last accepted draft).
-        if !rejected && accepted_count == k && generated.len() < max_new_tokens {
+        // 4. Bonus token: only when all k drafts were accepted *and* we still
+        //    have room for one more token under max_new_tokens.
+        if !rejected && commits.len() == k && generated.len() + commits.len() < max_new_tokens {
             let p_probs = softmax_with_temperature(&target_batched[k], config.temperature)?;
-            let tok = sample_from_distribution(rng, &p_probs)? as u32;
-            target.observe(&[tok]);
-            generated.push(tok);
+            let bonus = sample_from_distribution(rng, &p_probs)? as u32;
+            commits.push(bonus);
         }
 
-        // 5. Re-sync draft history to match target. Wasteful (full re-observe),
-        //    but correctness-first. The real-model path uses KV-cache rollback.
-        let synced: Vec<u32> = target.history().to_vec();
-        draft.reset();
-        draft.observe(&synced);
+        // 5. Re-anchor both decoders to the committed prefix.
+        target.rollback_to(pre_target_len)?;
+        target.observe(&commits)?;
+        draft.rollback_to(pre_draft_len)?;
+        draft.observe(&commits)?;
+
+        generated.extend_from_slice(&commits);
     }
 
     Ok(generated)
+}
+
+/// Mock-only convenience wrapper retained for the in-module statistical tests.
+///
+/// New code should call [`run_vanilla_sd`] directly against any [`crate::model::Decoder`].
+#[cfg(any(test, feature = "test-util"))]
+pub fn run_vanilla_sd_with_mock<R: rand::Rng>(
+    target: &mut crate::model::mock::MockDecoder,
+    draft: &mut crate::model::mock::MockDecoder,
+    prompt: &[u32],
+    max_new_tokens: usize,
+    config: &VanillaConfig,
+    rng: &mut R,
+) -> Result<Vec<u32>> {
+    run_vanilla_sd(target, draft, prompt, max_new_tokens, config, rng)
 }
 
 #[cfg(test)]

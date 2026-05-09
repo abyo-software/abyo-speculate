@@ -10,6 +10,7 @@
 
 #![cfg(any(test, feature = "test-util"))]
 
+use crate::Result;
 use std::sync::Arc;
 
 /// Function `(prefix, position) → logits over vocab`.
@@ -108,6 +109,48 @@ impl MockDecoder {
             out.push((self.logits_fn)(&prefix, prefix.len()));
         }
         out
+    }
+}
+
+impl super::Decoder for MockDecoder {
+    fn vocab_size(&self) -> usize {
+        self.vocab_size
+    }
+
+    fn history(&self) -> &[u32] {
+        &self.history
+    }
+
+    fn reset(&mut self) {
+        self.history.clear();
+    }
+
+    fn observe(&mut self, ids: &[u32]) -> Result<()> {
+        self.history.extend_from_slice(ids);
+        Ok(())
+    }
+
+    fn next_logits(&mut self) -> Result<Vec<f32>> {
+        Ok(MockDecoder::next_logits(self))
+    }
+
+    fn batched_logits(&mut self, drafts: &[u32]) -> Result<Vec<Vec<f32>>> {
+        let out = MockDecoder::batched_logits(self, drafts);
+        // Match the contract: leave the decoder positioned as if it had
+        // observed `drafts`. The caller will roll back what it doesn't keep.
+        self.history.extend_from_slice(drafts);
+        Ok(out)
+    }
+
+    fn rollback_to(&mut self, len: usize) -> Result<()> {
+        if len > self.history.len() {
+            return Err(crate::Error::CacheRollback(format!(
+                "rollback target {len} > history length {}",
+                self.history.len()
+            )));
+        }
+        self.history.truncate(len);
+        Ok(())
     }
 }
 
