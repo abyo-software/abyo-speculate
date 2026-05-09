@@ -1,0 +1,31 @@
+/target
+**/*.rs.bk
+*.pdb
+Cargo.lock.bak
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Model artifacts (downloaded at runtime)
+models/
+*.safetensors
+*.gguf
+*.bin
+*.pt
+
+# Bench output
+/bench-results/
+*.csv.tmp
+
+# Local secrets (never commit)
+.env
+.env.*
+
+# Python (if any tooling lands)
+__pycache__/
+*.pyc
+.venv/

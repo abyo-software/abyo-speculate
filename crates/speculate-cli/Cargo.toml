@@ -1,0 +1,39 @@
+[package]
+name = "abyo-speculate-cli"
+description = "Benchmark and demo CLI for abyo-speculate"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+publish = false
+
+[[bin]]
+name = "abyo-speculate-bench"
+path = "src/bin/bench.rs"
+
+[[bin]]
+name = "abyo-speculate-demo"
+path = "src/bin/demo.rs"
+
+[dependencies]
+abyo-speculate = { path = "../speculate" }
+candle-core = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+indicatif = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[features]
+default = []
+cuda = ["abyo-speculate/cuda", "candle-core/cuda"]
+metal = ["abyo-speculate/metal", "candle-core/metal"]
+mkl = ["abyo-speculate/mkl", "candle-core/mkl"]
+accelerate = ["abyo-speculate/accelerate", "candle-core/accelerate"]
