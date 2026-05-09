@@ -63,13 +63,20 @@ let engine = SpeculateEngine::preset_for("qwen-2.5-7b")?;
 
 ## Honest benchmarks
 
-Numbers are filled in once a real-GPU run is complete. We will publish:
+First measured speedup on RTX 4070 Ti SUPER (BF16, 128 tokens, k = 4):
 
-- per-model × per-task speedups (chat / coding / translation / long-context)
-- absolute `tok/s` (baseline vs each SD method)
-- the cases where SD does **not** help (MoE models, high-temperature sampling, very short outputs)
+| Target | Draft | AR tok/s | SD tok/s | Speedup |
+|--------|-------|---------:|---------:|--------:|
+| Qwen 2.5 1.5B | Qwen 2.5 0.5B | 60.4 | 59.7 | 0.99× |
+| **Qwen 2.5 3B** | **Qwen 2.5 0.5B** | **34.3** | **49.0** | **1.43×** |
+| Qwen 2.5 7B | Qwen 2.5 0.5B | 18.5 | OOM* | N/A |
 
-We won't quote a single "3× faster" headline number. SD is workload-dependent and we'll say so.
+\* 7B target + 0.5B draft both in BF16 don't fit alongside attention buffers
+on a 16 GB card.
+
+We do **not** quote a single headline ratio — see [`BENCHMARKS.md`](./BENCHMARKS.md)
+for the full table including a `draft_lookahead` sweep, reproducer commands,
+and the cases where SD currently does not help.
 
 ## Building
 
