@@ -9,19 +9,64 @@ While the project is at `0.x`, breaking changes can land in any minor or
 patch release; we'll only commit to `1.x`-style stability after the API
 shape has been used in anger by at least one external project.
 
-## [Unreleased] — v0.2.0
+## [0.2.0] — 2026-05-10
 
-### Coming up
+### Methods
 
-- **EAGLE-2 / EAGLE-3** (Li et al. 2024-2025): higher acceptance rates
-  than Medusa via target-hidden-state-conditioned drafts. Tree-attention
-  primitives and the verification math are in place; the EAGLE-specific
-  draft architecture + dynamic tree construction land next.
-- Real Q4 / GGUF speedup numbers for Qwen 2.5 7B + 0.5B BF16 draft.
-  The plumbing is in `quantized_qwen2_local`; just needs an integration
-  test against a published Q4_K_M GGUF.
-- Better tokenizer-aware streaming with detokenization on every emitted
-  token (current streaming is at the token-id level).
+- **EAGLE-2** (Li et al. 2024) end-to-end against the published
+  `yuhuili/EAGLE-LLaMA3-Instruct-8B` checkpoint with Llama 3 8B
+  Instruct **Q4_K_M GGUF** as the target. The full Cartesian-product
+  tree path runs greedy-acceptance correctly (output text matches the
+  AR baseline).
+- **EAGLE-2 dynamic tree pruning** (`EagleRunConfig::max_tree_nodes`):
+  builds the full Cartesian tree, then keeps the top-N nodes by
+  cumulative log-prob path score plus their ancestor closure. Reduces
+  `tree_logits` cost without changing correctness.
+- **EAGLE-3** (Li et al. 2025) wired end-to-end against
+  `yuhuili/EAGLE3-LLaMA3.1-Instruct-8B`: 3-layer feature concat
+  (`low / mid / high`), midlayer with `input_layernorm` + `hidden_norm`
+  + 2*hidden attention input, own 32k draft `lm_head`, `d2t` translation
+  back to the target's 128k vocab.
+
+### Target side
+
+- `LlamaQuantDecoder` for GGUF Llama families (Llama 2 / 3 / 3.1) with
+  bundled HF tokenizer.
+- New `TreeDecoder::apply_lm_head`, `last_hidden_states_multi`,
+  `num_hidden_layers` trait methods so EAGLE/EAGLE-3 don't need to load
+  duplicate decoders or hand-roll closure-based plumbing.
+- Vendored `quantized_llama_local` with a tree-attention-friendly
+  `forward_with_positions` and a `forward_hidden_with_layers` that
+  exposes residual outputs at arbitrary depths.
+
+### Honest perf data
+
+End-to-end on Llama 3 8B Instruct **Q4_K_M** + EAGLE-2 LLaMA3 draft
+(prompt = "The capital of France is", max_tokens = 32, depth = 4, k = 2):
+
+| variant            | tok/s | speedup |
+|--------------------|-------|---------|
+| Autoregressive     | 45.84 | 1.00×   |
+| EAGLE-2 Cartesian  |  6.62 | 0.14×   |
+| EAGLE-2 Dyn-16     |  8.52 | 0.19×   |
+
+EAGLE-2 is **slower than autoregressive** on Q4 8B targets because the
+per-step `target.apply_lm_head` (Q4 × 128k vocab ≈ 50 ms each) costs
+more than a Q4 target step (~22 ms). EAGLE-2's design assumption
+(target step >> draft per-step overhead) breaks under heavy
+target-side quantization.
+
+EAGLE-3 against Llama 3.1 8B **Q4_K_M**: 0.21× over AR. Output text is
+coherent but diverges from greedy AR — most likely the trained-recipe
+layer indices and a midlayer normalisation detail need tuning. **v0.2.1
+target**: ≥ 1× on Q4 8B via correct EAGLE-3 wiring.
+
+### Other
+
+- 73 unit + statistical tests pass on CPU; two GPU-gated end-to-end
+  tests cover the EAGLE-2 / EAGLE-3 real-checkpoint paths.
+
+## [0.1.0] — 2026-05-10
 
 ## [0.1.0] — 2026-05-10
 
