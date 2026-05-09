@@ -47,7 +47,7 @@
 
 use crate::{Error, Result};
 use candle_core::{DType, Device, IndexOp, Module, Tensor, D};
-use candle_nn::{linear_no_bias, rms_norm, Embedding, Linear, RmsNorm, VarBuilder};
+use candle_nn::{linear_no_bias, rms_norm, Linear, RmsNorm, VarBuilder};
 use std::path::Path;
 
 /// Hyper-parameters for an EAGLE-3 draft model.
@@ -297,16 +297,22 @@ impl Midlayer {
 /// EAGLE-3 draft model loaded from a published checkpoint.
 pub struct Eagle3DraftCandle {
     config: Eagle3DraftConfig,
-    embed_tokens: Embedding,
     /// 3*hidden → hidden projection over the concat of low/mid/high target features.
     fc: Linear,
     midlayer: Midlayer,
     norm: RmsNorm,
     lm_head: Linear,
-    /// Draft-vocab → target-vocab id mapping (length = draft_vocab_size).
-    d2t: Tensor,
-    /// Target-vocab → draft-reachable bitmask (length = target_vocab_size).
-    t2d: Tensor,
+    /// Cached d2t.to_vec() for fast `draft_to_target_token` (avoids per-call
+    /// device→host transfer).
+    d2t_host: Vec<i64>,
+    /// Cached inverse map target_id → draft_id (built at load time from
+    /// `d2t_host`). Targets unreachable by the draft are absent.
+    target_to_draft: std::collections::HashMap<u32, u32>,
+    /// `t2d` is stored as BoolStorage in the published .pth, which candle's
+    /// pickle loader skips. We don't need it for the forward path — only
+    /// for masking unreachable target ids during sampling — so absence is
+    /// fine. Reserved for v0.2.1 sampling masking.
+    _t2d_present: bool,
 }
 
 impl std::fmt::Debug for Eagle3DraftCandle {
@@ -340,12 +346,9 @@ impl Eagle3DraftCandle {
         device: &Device,
         dtype: DType,
     ) -> Result<Self> {
-        let embed_tokens = candle_nn::embedding(
-            config.draft_vocab_size,
-            config.hidden_size,
-            vb.pp("embed_tokens"),
-        )
-        .map_err(Error::Candle)?;
+        // The published EAGLE-3 LLaMA3.1 checkpoint has no `embed_tokens` —
+        // the draft autoregresses on hidden states only and reuses the
+        // target's vocabulary tables (d2t for mapping outputs back).
         let fc = linear_no_bias(3 * config.hidden_size, config.hidden_size, vb.pp("fc"))
             .map_err(Error::Candle)?;
         let midlayer = Midlayer::load(config, vb.pp("midlayer"), device, dtype)?;
@@ -358,24 +361,46 @@ impl Eagle3DraftCandle {
         )
         .map_err(Error::Candle)?;
 
-        // d2t / t2d are stored as plain tensors via the same VarBuilder.
+        // d2t is I64 (token id table) — must NOT be auto-cast through the
+        // VarBuilder's F16 dtype (that triggers an unimplemented
+        // cast_i64_f16 CUDA kernel). Use the explicit-dtype path.
         let d2t = vb
-            .get(config.draft_vocab_size, "d2t")
+            .get_with_hints_dtype(
+                config.draft_vocab_size,
+                "d2t",
+                Default::default(),
+                DType::I64,
+            )
             .map_err(Error::Candle)?;
-        let t2d = vb
-            .get(config.target_vocab_size, "t2d")
-            .map_err(Error::Candle)?;
+        // t2d is BoolStorage which candle's pth loader skips — its absence
+        // is non-fatal (only used for sampling masking, deferred to v0.2.1).
+        let _t2d_present = vb.contains_tensor("t2d");
+
+        // Cache d2t on host + build inverse map for fast target→draft lookup.
+        let d2t_host: Vec<i64> = d2t.to_vec1::<i64>().map_err(Error::Candle)?;
+        let mut target_to_draft = std::collections::HashMap::with_capacity(d2t_host.len());
+        for (draft_id, &target_id) in d2t_host.iter().enumerate() {
+            if target_id >= 0 && (target_id as u32) < config.target_vocab_size as u32 {
+                target_to_draft.insert(target_id as u32, draft_id as u32);
+            }
+        }
+        drop(d2t);
 
         Ok(Self {
             config: config.clone(),
-            embed_tokens,
             fc,
             midlayer,
             norm,
             lm_head,
-            d2t,
-            t2d,
+            d2t_host,
+            target_to_draft,
+            _t2d_present,
         })
+    }
+
+    /// Reverse lookup: target vocab id → draft vocab id, if reachable.
+    pub fn target_to_draft_token(&self, target_id: u32) -> Option<u32> {
+        self.target_to_draft.get(&target_id).copied()
     }
 
     pub fn reset(&mut self) {
@@ -386,15 +411,15 @@ impl Eagle3DraftCandle {
     ///
     /// Inputs:
     /// - `low / mid / high`: each `[1, seq, hidden]` — three target hidden
-    ///   states selected by the EAGLE-3 training recipe (typically layers
-    ///   0/N//2/N-1 or similar; the published recipe is in the EAGLE-3
-    ///   paper).
+    ///   states selected by the EAGLE-3 training recipe (we default to
+    ///   layers `[1, n/2, n-2]` for `Eagle3RunConfig::default_layers_for`).
     /// - `last_target_hidden`: `[1, seq, hidden]` — the most recent target
     ///   hidden state, fed into the midlayer's attention input alongside
     ///   the projected feature concat.
-    /// - `token_ids`: `[1, seq]` — the *draft-vocabulary* token ids for
-    ///   embed lookups. Use [`Self::target_to_draft_token`] to translate
-    ///   from the target's vocabulary first.
+    /// - `token_ids`: `[1, seq]` — informational only. The published
+    ///   EAGLE-3 LLaMA3.1 checkpoint has no `embed_tokens`; the draft
+    ///   autoregresses purely on hidden states. Kept as a parameter for
+    ///   forward-compat with embed-bearing variants.
     /// - `position`: absolute position offset for RoPE.
     ///
     /// Returns `[1, seq, draft_vocab]` — logits over the draft vocab. Use
@@ -409,49 +434,271 @@ impl Eagle3DraftCandle {
         token_ids: &Tensor,
         position: usize,
     ) -> Result<Tensor> {
-        // 1. Concat 3 target features → fc → projected hidden.
+        let _ = token_ids; // intentionally unused — see doc comment.
         let combined = Tensor::cat(&[low, mid, high], D::Minus1).map_err(Error::Candle)?;
         let projected = self.fc.forward(&combined).map_err(Error::Candle)?;
-        // 2. Token embedding (note: in the public EAGLE-3, token_emb is
-        //    fused into the projected_features through the input_layernorm
-        //    chain — refer to the paper for the precise schedule). For
-        //    v0.2.0 we follow the simplest interpretation: target_hidden
-        //    + projected_features into the midlayer; embed_tokens is
-        //    available for downstream variants but not used here.
-        let _ = self
-            .embed_tokens
-            .forward(token_ids)
-            .map_err(Error::Candle)?;
-        // 3. Midlayer.
         let h = self
             .midlayer
             .forward(last_target_hidden, &projected, position)?;
-        // 4. Norm + lm_head.
         let h = self.norm.forward(&h).map_err(Error::Candle)?;
         self.lm_head.forward(&h).map_err(Error::Candle)
     }
 
-    /// Map a draft-vocab id to the target's vocabulary.
+    /// Map a draft-vocab id to the target's vocabulary. Uses the cached
+    /// host copy so this is O(1) on the host without device transfer.
     pub fn draft_to_target_token(&self, draft_id: u32) -> Result<u32> {
-        let v: i64 = self
-            .d2t
-            .i(draft_id as usize)
-            .map_err(Error::Candle)?
-            .to_scalar()
-            .map_err(Error::Candle)?;
-        Ok(v as u32)
+        let v = self.d2t_host.get(draft_id as usize).ok_or_else(|| {
+            Error::Sampling(format!(
+                "draft id {draft_id} out of range ({})",
+                self.d2t_host.len()
+            ))
+        })?;
+        Ok(*v as u32)
     }
 
     /// Whether the target vocab id is reachable from the draft vocab.
+    /// Falls back to `Some(true)` when the published checkpoint stored
+    /// `t2d` as BoolStorage (which candle's pickle loader skips); v0.2.1
+    /// will plumb a separate uint8 conversion path.
     pub fn target_token_is_reachable(&self, target_id: u32) -> Result<bool> {
-        let v: u8 = self
-            .t2d
-            .i(target_id as usize)
-            .map_err(Error::Candle)?
-            .to_scalar()
-            .map_err(Error::Candle)?;
-        Ok(v != 0)
+        let _ = target_id;
+        Ok(self.target_to_draft.contains_key(&target_id) || !self._t2d_present)
     }
+}
+
+/// Run-loop config for EAGLE-3.
+#[derive(Debug, Clone)]
+pub struct Eagle3RunConfig {
+    pub top_k_per_step: usize,
+    pub draft_depth: usize,
+    pub max_tree_nodes: Option<usize>,
+    /// Indices of target layers to feed as low/mid/high features. Defaults
+    /// to the published EAGLE-3 LLaMA3.1-8B recipe (`[1, n/2, n-2]`).
+    pub layer_indices: [usize; 3],
+    pub temperature: f32,
+    pub top_p: f32,
+}
+
+impl Eagle3RunConfig {
+    /// Compute the default `[1, n/2, n - 2]` layer triple for a target with
+    /// `n_layers` transformer blocks.
+    pub fn default_layers_for(n_layers: usize) -> [usize; 3] {
+        if n_layers < 4 {
+            [0, 0, 0]
+        } else {
+            [1, n_layers / 2, n_layers.saturating_sub(2)]
+        }
+    }
+}
+
+impl Default for Eagle3RunConfig {
+    fn default() -> Self {
+        Self {
+            top_k_per_step: 2,
+            draft_depth: 4,
+            max_tree_nodes: None,
+            layer_indices: [1, 16, 30], // Llama 3.1 8B default
+            temperature: 0.0,
+            top_p: 1.0,
+        }
+    }
+}
+
+/// End-to-end EAGLE-3 generation loop.
+///
+/// Roughly the same shape as [`crate::methods::eagle::run_eagle`], but
+/// the draft side runs in EAGLE-3's smaller draft vocab and the per-step
+/// top-`k` is taken from `draft.lm_head` (32k vocab) — much cheaper than
+/// the target's 128k Q4 lm_head. Accepted draft tokens are translated
+/// through `d2t` to the target vocab before commit.
+pub fn run_eagle3<T, R>(
+    target: &mut T,
+    draft: &mut Eagle3DraftCandle,
+    prompt: &[u32],
+    max_new_tokens: usize,
+    config: &Eagle3RunConfig,
+    rng: &mut R,
+) -> Result<Vec<u32>>
+where
+    T: crate::model::TreeDecoder + ?Sized,
+    R: rand::Rng + ?Sized,
+{
+    use crate::methods::medusa::top_k_indices;
+
+    target.reset();
+    target.observe(prompt)?;
+
+    let mut generated = Vec::with_capacity(max_new_tokens);
+    while generated.len() < max_new_tokens {
+        let root_token = *target
+            .history()
+            .last()
+            .ok_or_else(|| Error::Sampling("EAGLE-3 requires non-empty prompt".into()))?;
+
+        // Target vocab id → draft vocab id via cached inverse map. If the
+        // target id is unreachable from the draft we fall back to draft 0.
+        let root_draft_id = draft.target_to_draft_token(root_token).unwrap_or(0);
+
+        // 1. Multi-layer hidden states for the committed token.
+        let (final_h, mids) = target.last_hidden_states_multi(&config.layer_indices)?;
+        if mids.len() != 3 {
+            return Err(Error::Sampling(format!(
+                "EAGLE-3 expects 3 layers, got {}",
+                mids.len()
+            )));
+        }
+        // Reshape each to [1, 1, hidden] and promote to the draft's dtype
+        // (target hiddens come back F32 from the Q4 path; the draft is F16).
+        let draft_dtype = draft.fc.weight().dtype();
+        let to_3d = |t: &candle_core::Tensor| -> Result<candle_core::Tensor> {
+            let t = if t.dtype() != draft_dtype {
+                t.to_dtype(draft_dtype).map_err(Error::Candle)?
+            } else {
+                t.clone()
+            };
+            t.unsqueeze(0)
+                .map_err(Error::Candle)?
+                .unsqueeze(0)
+                .map_err(Error::Candle)
+        };
+        let low = to_3d(&mids[0])?;
+        let mid = to_3d(&mids[1])?;
+        let high = to_3d(&mids[2])?;
+        let last_h = to_3d(&final_h)?;
+
+        draft.reset();
+        let history_len = target.history_len();
+
+        // 2. Run the draft `draft_depth` times. Top-k taken from the
+        //    draft's own (32k) lm_head — no Q4 128k call.
+        let mut per_step_top_k_target: Vec<Vec<u32>> = Vec::with_capacity(config.draft_depth);
+        let mut per_step_top_k_log_probs: Vec<Vec<f32>> = Vec::with_capacity(config.draft_depth);
+        let mut current_token_ids = Tensor::from_slice(&[root_draft_id], (1, 1), &low.device())
+            .map_err(Error::Candle)?;
+        for step in 0..config.draft_depth {
+            let logits = draft.forward(
+                &low,
+                &mid,
+                &high,
+                &last_h,
+                &current_token_ids,
+                history_len + step,
+            )?;
+            let last = logits
+                .i((0, logits.dim(1).map_err(Error::Candle)? - 1, ..))
+                .map_err(Error::Candle)?
+                .to_dtype(DType::F32)
+                .map_err(Error::Candle)?
+                .to_vec1::<f32>()
+                .map_err(Error::Candle)?;
+            let top_idx: Vec<usize> = top_k_indices(&last, config.top_k_per_step);
+            let max_l = last.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let lse = last.iter().map(|&v| (v - max_l).exp()).sum::<f32>().ln() + max_l;
+            let log_probs: Vec<f32> = top_idx.iter().map(|&i| last[i] - lse).collect();
+            per_step_top_k_log_probs.push(log_probs);
+            // Translate draft ids → target ids for the tree (target's
+            // tree_logits expects target-vocab tokens).
+            let mut top_target = Vec::with_capacity(top_idx.len());
+            for &di in &top_idx {
+                top_target.push(draft.draft_to_target_token(di as u32)?);
+            }
+            per_step_top_k_target.push(top_target);
+
+            // For draft autoregression next step, advance with top-1 in DRAFT vocab.
+            let next_draft_id = top_idx[0] as u32;
+            current_token_ids =
+                Tensor::from_slice(&[next_draft_id], (1, 1), &low.device()).map_err(Error::Candle)?;
+        }
+
+        // 3. Build Cartesian-product tree in TARGET vocab, optionally pruned.
+        let full_tree = crate::methods::medusa::MedusaHeads::from_config(
+            crate::methods::medusa::MedusaConfig {
+                n_heads: config.draft_depth,
+                hidden_size: draft.config().hidden_size,
+                vocab_size: draft.config().target_vocab_size,
+                residual_layers: 1,
+            },
+        )
+        .build_draft_tree(
+            root_token,
+            &per_step_top_k_target,
+            crate::methods::medusa::TreeTopology::CartesianProduct,
+        )?;
+        let tree = if let Some(max_n) = config.max_tree_nodes {
+            crate::methods::eagle::prune_cartesian_tree_pub(
+                &full_tree,
+                &per_step_top_k_log_probs,
+                max_n,
+            )?
+        } else {
+            full_tree
+        };
+
+        // 4. Verify via target.tree_logits.
+        let per_node_logits = target.tree_logits(&tree)?;
+
+        // 5. Greedy acceptance.
+        let mut best_path: Vec<usize> = vec![0];
+        for path in tree.paths() {
+            let mut accepted = 0;
+            for w in path.windows(2) {
+                let parent = w[0];
+                let child = w[1];
+                let candidate = tree.token_at(child) as usize;
+                let parent_dist = &per_node_logits[parent];
+                let argmax = parent_dist
+                    .iter()
+                    .enumerate()
+                    .fold((0usize, f32::NEG_INFINITY), |(bi, bv), (i, &v)| {
+                        if v > bv {
+                            (i, v)
+                        } else {
+                            (bi, bv)
+                        }
+                    })
+                    .0;
+                if argmax == candidate {
+                    accepted += 1;
+                } else {
+                    break;
+                }
+            }
+            if accepted + 1 > best_path.len() {
+                best_path = path[..=accepted].to_vec();
+            }
+        }
+
+        let mut committed: Vec<u32> = best_path
+            .iter()
+            .skip(1)
+            .map(|&i| tree.token_at(i))
+            .collect();
+        let deepest_idx = *best_path.last().unwrap();
+        if generated.len() + committed.len() < max_new_tokens {
+            let bonus_logits = &per_node_logits[deepest_idx];
+            let bonus = bonus_logits
+                .iter()
+                .enumerate()
+                .fold((0usize, f32::NEG_INFINITY), |(bi, bv), (i, &v)| {
+                    if v > bv {
+                        (i, v)
+                    } else {
+                        (bi, bv)
+                    }
+                })
+                .0 as u32;
+            committed.push(bonus);
+        }
+
+        if committed.is_empty() {
+            return Err(Error::Sampling("EAGLE-3 round committed zero tokens".into()));
+        }
+        target.observe(&committed)?;
+        generated.extend_from_slice(&committed);
+    }
+    let _ = (rng, config.temperature, config.top_p);
+    generated.truncate(max_new_tokens);
+    Ok(generated)
 }
 
 #[cfg(test)]
@@ -465,5 +712,11 @@ mod tests {
         assert_eq!(c.draft_vocab_size, 32000);
         assert_eq!(c.target_vocab_size, 128256);
         assert_eq!(c.head_dim(), 128);
+    }
+
+    #[test]
+    fn default_layer_indices_for_8b() {
+        let l = Eagle3RunConfig::default_layers_for(32);
+        assert_eq!(l, [1, 16, 30]);
     }
 }

@@ -306,6 +306,11 @@ impl ModelWeights {
         self.output.forward(hidden)
     }
 
+    /// Number of transformer layers in this model.
+    pub fn num_hidden_layers(&self) -> usize {
+        self.layers.len()
+    }
+
     fn causal_bias(&mut self, prev_len: usize, seq_len: usize) -> Result<Tensor> {
         let total = prev_len + seq_len;
         let key = (prev_len << 20) | seq_len;
@@ -329,6 +334,20 @@ impl ModelWeights {
     /// Plain autoregressive forward; returns hidden states for all positions
     /// (no last-position slice, no LM head).
     pub fn forward_hidden(&mut self, x: &Tensor, index_pos: usize) -> Result<Tensor> {
+        let (final_h, _) = self.forward_hidden_with_layers(x, index_pos, &[])?;
+        Ok(final_h)
+    }
+
+    /// Same as [`Self::forward_hidden`] but additionally collects the hidden
+    /// state *after* each layer index in `collect_layers` (each layer index
+    /// referring to the residual output of `layers[i]`, before the final
+    /// `norm`). Used by EAGLE-3 to get low/mid/high target features.
+    pub fn forward_hidden_with_layers(
+        &mut self,
+        x: &Tensor,
+        index_pos: usize,
+        collect_layers: &[usize],
+    ) -> Result<(Tensor, Vec<Tensor>)> {
         let (_b_sz, seq_len) = x.dims2()?;
         let bias = if seq_len <= 1 {
             None
@@ -341,7 +360,8 @@ impl ModelWeights {
             Some(self.causal_bias(prev_len, seq_len)?)
         };
         let mut layer_in = self.tok_embeddings.forward(x)?;
-        for layer in self.layers.iter_mut() {
+        let mut collected: Vec<Option<Tensor>> = vec![None; collect_layers.len()];
+        for (li, layer) in self.layers.iter_mut().enumerate() {
             let x = layer_in;
             let residual = &x;
             let xn = layer.attn_norm.forward(&x)?;
@@ -351,8 +371,23 @@ impl ModelWeights {
             let xn = layer.ffn_norm.forward(&x)?;
             let m = layer.mlp.forward(&xn)?;
             layer_in = (m + residual)?;
+            for (slot, &want) in collect_layers.iter().enumerate() {
+                if want == li {
+                    collected[slot] = Some(layer_in.clone());
+                }
+            }
         }
-        self.norm.forward(&layer_in)
+        let final_h = self.norm.forward(&layer_in)?;
+        let mut out = Vec::with_capacity(collected.len());
+        for (slot, want) in collect_layers.iter().enumerate() {
+            out.push(collected[slot].clone().ok_or_else(|| {
+                candle_core::Error::Msg(format!(
+                    "collect_layers[{slot}] = {want} out of range (n_layers={})",
+                    self.layers.len()
+                ))
+            })?);
+        }
+        Ok((final_h, out))
     }
 
     /// Tree-decoding forward — same contract as

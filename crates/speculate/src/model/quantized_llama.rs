@@ -167,6 +167,48 @@ impl LlamaQuantDecoder {
         hidden.i((0, 0, ..)).map_err(Error::Candle)
     }
 
+    /// Hidden states of the most recent committed token at multiple layers.
+    /// Returns `(final_norm_output, [layer_outputs in `layers` order])`. Used
+    /// by EAGLE-3 (low/mid/high feature concat).
+    ///
+    /// Layer indices are 0-based and refer to the residual output *after*
+    /// `layers[i]`'s MLP — i.e. the input to `layers[i+1]` (or to `norm` if
+    /// `i == n_layers - 1`).
+    pub fn last_hidden_states_multi(
+        &mut self,
+        layers: &[usize],
+    ) -> Result<(Tensor, Vec<Tensor>)> {
+        if self.history.is_empty() {
+            return Err(Error::Sampling(
+                "last_hidden_states_multi with empty history".into(),
+            ));
+        }
+        let last = *self.history.last().unwrap();
+        let target_len = self.history.len() - 1;
+        self.model
+            .truncate_kv_cache_to(target_len)
+            .map_err(Error::Candle)?;
+        self.cache_len = target_len;
+        let input = Tensor::from_slice(&[last], (1, 1), &self.device).map_err(Error::Candle)?;
+        let (final_h, mids) = self
+            .model
+            .forward_hidden_with_layers(&input, self.cache_len, layers)
+            .map_err(Error::Candle)?;
+        self.cache_len += 1;
+        // Slice each to the last position only (seq=1 here, so position 0).
+        let mids_last: Vec<Tensor> = mids
+            .into_iter()
+            .map(|t| t.i((0, 0, ..)).map_err(Error::Candle))
+            .collect::<Result<_>>()?;
+        let final_last = final_h.i((0, 0, ..)).map_err(Error::Candle)?;
+        Ok((final_last, mids_last))
+    }
+
+    /// Number of transformer layers (used by EAGLE-3 to pick low/mid/high).
+    pub fn num_hidden_layers(&self) -> usize {
+        self.model.num_hidden_layers()
+    }
+
     pub fn tree_logits(&mut self, tree: &DraftTree) -> Result<Vec<Vec<f32>>> {
         if self.history.is_empty() {
             return Err(Error::Sampling("tree_logits with empty history".into()));
@@ -232,6 +274,17 @@ impl TreeDecoder for LlamaQuantDecoder {
 
     fn apply_lm_head(&self, hidden: &Tensor) -> Result<Tensor> {
         LlamaQuantDecoder::apply_lm_head(self, hidden)
+    }
+
+    fn last_hidden_states_multi(
+        &mut self,
+        layers: &[usize],
+    ) -> Result<(Tensor, Vec<Tensor>)> {
+        LlamaQuantDecoder::last_hidden_states_multi(self, layers)
+    }
+
+    fn num_hidden_layers(&self) -> usize {
+        LlamaQuantDecoder::num_hidden_layers(self)
     }
 }
 

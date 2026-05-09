@@ -635,6 +635,15 @@ where
     Ok(generated)
 }
 
+/// Pub-facing alias of [`prune_cartesian_tree`] for the EAGLE-3 module.
+pub fn prune_cartesian_tree_pub(
+    full: &crate::tree::DraftTree,
+    per_step_log_probs: &[Vec<f32>],
+    max_total_nodes: usize,
+) -> Result<crate::tree::DraftTree> {
+    prune_cartesian_tree(full, per_step_log_probs, max_total_nodes)
+}
+
 /// Prune a Cartesian-product `DraftTree` (built by
 /// [`crate::methods::medusa::TreeTopology::CartesianProduct`]) down to at
 /// most `max_total_nodes` nodes by keeping the highest-cumulative-log-prob

@@ -135,4 +135,26 @@ pub trait TreeDecoder: Decoder {
             reason: "this TreeDecoder does not expose its lm_head".into(),
         })
     }
+
+    /// Hidden states at multiple layer indices for the most recent committed
+    /// token. Returns `(final_layer_hidden, layer_hiddens_for(layers))`. Used
+    /// by EAGLE-3's low/mid/high concat input. Default impl returns
+    /// `UnsupportedMethod`.
+    fn last_hidden_states_multi(
+        &mut self,
+        layers: &[usize],
+    ) -> Result<(candle_core::Tensor, Vec<candle_core::Tensor>)> {
+        let _ = layers;
+        Err(crate::Error::UnsupportedMethod {
+            method: "last_hidden_states_multi",
+            reason: "this TreeDecoder does not expose intermediate layers".into(),
+        })
+    }
+
+    /// Number of transformer layers in this decoder. Default `0` — implement
+    /// when callers (EAGLE-3) need to compute layer indices like `n/2` or
+    /// `n - 2`.
+    fn num_hidden_layers(&self) -> usize {
+        0
+    }
 }
