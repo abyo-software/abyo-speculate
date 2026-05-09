@@ -65,15 +65,33 @@ fn argmax_u32(logits: &[f32]) -> u32 {
 }
 
 #[test]
-#[ignore = "downloads ~14GB of pytorch shards and needs ~15GB GPU memory"]
+#[ignore = "downloads ~14GB of pytorch shards and needs ~15GB GPU memory; \
+            set ABYO_LARGE_GPU=1 to enable (24GB+ GPU recommended — 16GB OOMs \
+            during the head load)"]
 fn vicuna_7b_with_real_medusa_heads() {
+    if std::env::var("ABYO_LARGE_GPU").ok().as_deref() != Some("1") {
+        eprintln!(
+            "skipping vicuna_7b_with_real_medusa_heads — set ABYO_LARGE_GPU=1 \
+             to opt in. Current 16 GB hardware OOMs at MedusaHeadsCandle \
+             load time (Vicuna 7B BF16 ~14 GB + 5 Medusa heads ~1.5 GB > 16 GB \
+             when activations are also resident)."
+        );
+        return;
+    }
     use abyo_speculate::model::hub::download_files;
 
-    // 1. Download the multi-shard pytorch checkpoint + the config + tokenizer.
+    // 1. Download the multi-shard pytorch checkpoint + the config.
     let (index_path, shard_paths) = download_pth_sharded(REPO).expect("download pth shards");
-    let aux = download_files(REPO, &["config.json", "tokenizer.json"]).expect("download aux");
+    let aux = download_files(REPO, &["config.json"]).expect("download aux");
     let config_path = &aux[0];
-    let tokenizer_path = &aux[1];
+    // FasterDecoding's repo (and lmsys/vicuna-7b-v1.5 itself) only ship the
+    // SentencePiece `tokenizer.model`; the `tokenizers` crate wants the HF
+    // JSON format. Llama-2-derived models share the same vocabulary, so we
+    // borrow TinyLlama's tokenizer.json — same 32k-token Llama 2 SP
+    // vocabulary, just packaged in HF JSON.
+    let tok_alt = download_files("TinyLlama/TinyLlama-1.1B-Chat-v1.0", &["tokenizer.json"])
+        .expect("download Llama-2 tokenizer.json from TinyLlama");
+    let tokenizer_path = &tok_alt[0];
 
     // 2. Parse Vicuna-shaped LlamaConfig (the FasterDecoding repo's
     //    config.json is a Llama config; the medusa-specific config.json

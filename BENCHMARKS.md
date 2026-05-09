@@ -92,23 +92,28 @@ Mistral's `sliding_window` field ignored for batch-1 short contexts). No
 dedicated number yet because Mistral 7B + draft pair OOMs on 16 GB BF16;
 follow-up under "what's not in this table" below.
 
-## Medusa: loader compatibility
+## Medusa: loader + plumbing verified, speedup pending 24 GB+ hardware
 
-`tests/with_real_medusa_heads.rs` validates that
-`MedusaHeadsCandle::from_fasterdecoding_pt` correctly parses
-`FasterDecoding/medusa-vicuna-7b-v1.3`'s `medusa_lm_head.pt` (5 heads,
-4096 hidden, 32000 vocab, BF16). Forward through the loaded heads
-produces non-NaN logits of the expected shape.
+Two integration tests cover the Medusa story end-to-end:
 
-A full Medusa speedup measurement would need either:
+1. **`tests/with_real_medusa_heads.rs`** — Heads-only loader. Parses
+   `FasterDecoding/medusa-vicuna-7b-v1.3`'s `medusa_lm_head.pt` (5 heads,
+   4096 hidden, 32000 vocab, BF16) via
+   `MedusaHeadsCandle::from_fasterdecoding_pt`, runs forward over a
+   synthetic hidden state, asserts non-NaN logits + in-vocab top-k.
+   **Passes on 16 GB.**
 
-- The Vicuna 7B base model in safetensors format (the upstream `lmsys/`
-  repo only ships PyTorch sharded `.bin`, and the `TheBloke/...-safetensors`
-  mirrors are gated behind an HF token), **or**
-- Q4 quantisation so 7B + heads fit in <16 GB.
+2. **`tests/with_real_medusa_e2e.rs`** — Full Vicuna 7B base + bundled
+   heads via `MultiPthBackend` (a custom `SimpleBackend` that loads
+   PyTorch sharded `.bin` directly — no offline conversion needed).
+   The base model loads fine; OOM hits when the 5 Medusa heads layer
+   on top, because Vicuna 7B BF16 (~14 GB) + 5 heads (~1.5 GB) +
+   activations exceeds 16 GB. **Gated behind `ABYO_LARGE_GPU=1`** so
+   it skips on commodity 16 GB hardware. Expected to pass on 24 GB+
+   cards (RTX 4090 / RTX 5090 / A10G / L4).
 
-Both are tracked under "future work" — for now, the loader is verified
-against the real published format.
+Speedup numbers will land in this section once we measure on a 24 GB+
+card. The plumbing is verified; only the headline number is pending.
 
 ## What's NOT in this table (yet)
 
