@@ -4,6 +4,7 @@
 //! can dispatch generically.
 
 pub mod eagle;
+pub mod eagle3;
 pub mod medusa;
 pub mod vanilla;
 
