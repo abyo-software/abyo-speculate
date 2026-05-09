@@ -38,6 +38,7 @@ pub struct Qwen2Decoder {
     device: Device,
     dtype: DType,
     vocab_size: usize,
+    hidden_size: usize,
     /// Mirrors `model.kv_cache_len()`. Maintained explicitly so we can avoid
     /// querying the model on hot paths.
     cache_len: usize,
@@ -98,8 +99,24 @@ impl Qwen2Decoder {
             device,
             dtype,
             vocab_size: config.vocab_size,
+            hidden_size: config.hidden_size,
             cache_len: 0,
         })
+    }
+
+    /// Device the model is on.
+    pub fn device(&self) -> &Device {
+        &self.device
+    }
+
+    /// Tensor dtype the model uses internally.
+    pub fn dtype(&self) -> DType {
+        self.dtype
+    }
+
+    /// Hidden dim of the model — the input dim a Medusa head expects.
+    pub fn hidden_size(&self) -> usize {
+        self.hidden_size
     }
 
     /// Encode a string to token ids via the bundled tokenizer.
@@ -136,6 +153,35 @@ impl Qwen2Decoder {
         let logits = logits.i((0, .., ..)).map_err(Error::Candle)?;
         self.cache_len += tokens.len();
         Ok(logits)
+    }
+
+    /// Compute the hidden state for the *next* position (i.e. the one a
+    /// Medusa head would consume). Returns a `[hidden_size]` tensor on the
+    /// model's device, with the cache state restored to its pre-call value.
+    ///
+    /// Implementation: truncate the cache by 1, re-forward the last committed
+    /// token, take the model's hidden state output (pre-LM-head). Same
+    /// truncate-and-replay trick as `next_logits` but stops one step earlier.
+    pub fn last_hidden_state(&mut self) -> Result<Tensor> {
+        if self.history.is_empty() {
+            return Err(Error::Sampling(
+                "last_hidden_state with empty history".into(),
+            ));
+        }
+        let last = *self.history.last().unwrap();
+        let target_len = self.history.len() - 1;
+        self.model
+            .truncate_kv_cache_to(target_len)
+            .map_err(Error::Candle)?;
+        self.cache_len = target_len;
+        let input = Tensor::from_slice(&[last], (1, 1), &self.device).map_err(Error::Candle)?;
+        let hidden = self
+            .model
+            .forward(&input, self.cache_len)
+            .map_err(Error::Candle)?;
+        self.cache_len += 1;
+        // hidden shape: [1, 1, hidden_size] → squeeze to [hidden_size].
+        hidden.i((0, 0, ..)).map_err(Error::Candle)
     }
 
     /// Materialize a single `[vocab]` tensor row to host `f32`.

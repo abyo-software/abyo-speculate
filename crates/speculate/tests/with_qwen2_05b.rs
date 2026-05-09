@@ -19,12 +19,17 @@
 
 #![cfg(not(target_os = "windows"))] // hf-hub on Windows uses a different cache layout we don't test
 
+use abyo_speculate::methods::medusa::{
+    run_medusa_real, Acceptance, MedusaConfig, MedusaHeads, MedusaHeadsCandle, MedusaRunConfig,
+    TreeTopology,
+};
 use abyo_speculate::model::hub::download_qwen2_single_shard;
 use abyo_speculate::model::qwen2::Qwen2Decoder;
 use abyo_speculate::model::qwen2_local::Config;
 use abyo_speculate::model::Decoder;
 use abyo_speculate::tree::DraftTree;
 use candle_core::{DType, Device};
+use rand::SeedableRng;
 
 const REPO: &str = "Qwen/Qwen2.5-0.5B-Instruct";
 
@@ -175,4 +180,57 @@ fn tree_logits_match_per_path_observation_for_linear_tree() {
 
     // Cache state must be unchanged after tree_logits.
     assert_eq!(dec.history().len(), prompt.len());
+}
+
+#[test]
+#[ignore = "downloads ~1GB and requires GPU for tolerable speed"]
+fn medusa_pipeline_with_synthetic_heads() {
+    // End-to-end Medusa loop against the real Qwen2 target with random-init
+    // heads. We only assert that the loop:
+    //   - completes without erroring,
+    //   - produces exactly max_new_tokens tokens,
+    //   - that those tokens are within the vocab.
+    // We do NOT assert that the output is meaningful — random heads make the
+    // greedy acceptance reject every draft, falling back to bonus-only
+    // generation (target's argmax per round).
+    let mut target = load_decoder();
+    let prompt = target.encode("Two plus two equals", true).unwrap();
+
+    let device = target.device().clone();
+    let dtype = target.dtype();
+    let medusa_cfg = MedusaConfig {
+        n_heads: 3,
+        hidden_size: target.hidden_size(),
+        vocab_size: target.vocab_size(),
+        residual_layers: 1,
+    };
+    let heads = MedusaHeadsCandle::from_random(&medusa_cfg, &device, dtype).unwrap();
+    let skeleton = MedusaHeads::from_config(medusa_cfg.clone());
+
+    let cfg = MedusaRunConfig {
+        topology: TreeTopology::Greedy,
+        top_k_per_head: 1,
+        acceptance: Acceptance::Greedy,
+    };
+    let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+
+    let max_new = 12;
+    let out = run_medusa_real(
+        &mut target,
+        &heads,
+        &skeleton,
+        &prompt,
+        max_new,
+        &cfg,
+        &mut rng,
+    )
+    .unwrap();
+
+    assert_eq!(out.len(), max_new);
+    let v = target.vocab_size() as u32;
+    for &tok in &out {
+        assert!(tok < v, "token {tok} outside vocab {v}");
+    }
+    let text = target.decode(&out, true).unwrap();
+    println!("synthetic-heads Medusa output: {text}");
 }

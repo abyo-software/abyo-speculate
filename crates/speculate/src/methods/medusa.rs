@@ -19,13 +19,24 @@
 //!   Cartesian-product topology.
 //! - Unit tests against synthetic head outputs.
 //!
+//! ## Phase 1b real-model (also in this module)
+//!
+//! - [`MedusaHeadModule`]: one head's residual MLP + projection forward,
+//!   with a `from_random` constructor for synthetic-init testing and a
+//!   `from_var_builder` constructor for loading published checkpoints.
+//! - [`MedusaHeadsCandle`]: bundle of `N` heads + `top_k_per_head` helper
+//!   that turns a target hidden state into per-head candidate tokens.
+//! - [`run_medusa_real`]: end-to-end Medusa loop against a real
+//!   [`crate::model::qwen2::Qwen2Decoder`] target — uses `tree_logits` for
+//!   single-pass tree verification (Phase 1c) instead of the per-path
+//!   walk in [`run_medusa`].
+//!
 //! ## What is **not** yet here
 //!
-//! - The forward pass through a real Medusa head (residual MLP + projection):
-//!   the head weights have to come from a trained checkpoint
-//!   (e.g. `FasterDecoding/medusa-vicuna-7b-v1.3` on Hugging Face). Loader +
-//!   `Decoder` impl land in a follow-up task; this module is the structural
-//!   foundation everything else hangs off.
+//! - Loaders for specific community Medusa checkpoints (`FasterDecoding/...`).
+//!   The forward path is in place; pointing it at a public checkpoint is a
+//!   follow-up once a Qwen-compatible head is available (most published
+//!   heads target Vicuna / Llama 2).
 
 #![allow(clippy::needless_range_loop)]
 
@@ -473,6 +484,268 @@ pub fn top_k_indices(logits: &[f32], k: usize) -> Vec<usize> {
             .then_with(|| a.0.cmp(&b.0))
     });
     indexed.into_iter().take(k).map(|(i, _)| i).collect()
+}
+
+// ============================================================================
+// Phase 1b real-model: candle-backed Medusa heads + Qwen2 integration loop.
+// ============================================================================
+
+use crate::model::qwen2::Qwen2Decoder;
+use candle_core::{DType, Device, Module, Tensor};
+use candle_nn::{linear, linear_no_bias, Linear, VarBuilder};
+use std::path::Path;
+
+/// One Medusa head: a stack of residual MLP layers followed by a projection
+/// onto the vocabulary.
+///
+/// The architecture mirrors Cai et al. 2024: each residual block is
+/// `x -> x + SiLU(linear(x))`, then a final `linear_no_bias(hidden -> vocab)`.
+///
+/// Two constructors:
+/// - [`Self::from_random`] — synthetic initialization for plumbing tests.
+/// - [`Self::from_var_builder`] — load published checkpoints via candle's
+///   safetensors VarBuilder.
+#[derive(Debug, Clone)]
+pub struct MedusaHeadModule {
+    res_blocks: Vec<Linear>,
+    output_proj: Linear,
+}
+
+impl MedusaHeadModule {
+    /// Load one head's weights from a candle [`VarBuilder`] sub-namespace.
+    ///
+    /// Expected key layout (matches the FasterDecoding Medusa convention):
+    /// - `res.<i>.weight` / `res.<i>.bias` for `i in 0..residual_layers`
+    /// - `output.weight` for the final projection
+    pub fn from_var_builder(cfg: &MedusaConfig, vb: VarBuilder<'_>) -> Result<Self> {
+        let mut res_blocks = Vec::with_capacity(cfg.residual_layers);
+        for i in 0..cfg.residual_layers {
+            let l = linear(cfg.hidden_size, cfg.hidden_size, vb.pp(format!("res.{i}")))
+                .map_err(Error::Candle)?;
+            res_blocks.push(l);
+        }
+        let output_proj = linear_no_bias(cfg.hidden_size, cfg.vocab_size, vb.pp("output"))
+            .map_err(Error::Candle)?;
+        Ok(Self {
+            res_blocks,
+            output_proj,
+        })
+    }
+
+    /// Build a head with random Gaussian-init weights.
+    ///
+    /// Predictions from such a head are near-uniform — useful only for
+    /// verifying the forward pipeline and shape contracts. Use
+    /// [`Self::from_var_builder`] for published checkpoints.
+    pub fn from_random(cfg: &MedusaConfig, device: &Device, dtype: DType) -> Result<Self> {
+        let mut res_blocks = Vec::with_capacity(cfg.residual_layers);
+        for _ in 0..cfg.residual_layers {
+            let w = Tensor::randn(0f32, 0.02, (cfg.hidden_size, cfg.hidden_size), device)
+                .map_err(Error::Candle)?
+                .to_dtype(dtype)
+                .map_err(Error::Candle)?;
+            let b = Tensor::zeros(cfg.hidden_size, dtype, device).map_err(Error::Candle)?;
+            res_blocks.push(Linear::new(w, Some(b)));
+        }
+        let w = Tensor::randn(0f32, 0.02, (cfg.vocab_size, cfg.hidden_size), device)
+            .map_err(Error::Candle)?
+            .to_dtype(dtype)
+            .map_err(Error::Candle)?;
+        let output_proj = Linear::new(w, None);
+        Ok(Self {
+            res_blocks,
+            output_proj,
+        })
+    }
+
+    /// Apply the head to a hidden state. The input may be `[hidden]`,
+    /// `[seq, hidden]`, or `[batch, seq, hidden]`; the output's leading dims
+    /// match the input, with the trailing dim swapped to `vocab_size`.
+    pub fn forward(&self, hidden: &Tensor) -> Result<Tensor> {
+        let needs_squeeze = hidden.dims().len() == 1;
+        let mut x = if needs_squeeze {
+            hidden.unsqueeze(0).map_err(Error::Candle)?
+        } else {
+            hidden.clone()
+        };
+        for rb in &self.res_blocks {
+            // Residual block: x' = x + SiLU(linear(x))
+            let y = candle_nn::ops::silu(&rb.forward(&x).map_err(Error::Candle)?)
+                .map_err(Error::Candle)?;
+            x = (y + &x).map_err(Error::Candle)?;
+        }
+        let logits = self.output_proj.forward(&x).map_err(Error::Candle)?;
+        if needs_squeeze {
+            logits.squeeze(0).map_err(Error::Candle)
+        } else {
+            Ok(logits)
+        }
+    }
+}
+
+/// Bundle of `N` Medusa heads attached to a target. Wraps
+/// [`MedusaHeadModule`]s plus a `top_k_per_head` materialization helper.
+#[derive(Debug, Clone)]
+pub struct MedusaHeadsCandle {
+    config: MedusaConfig,
+    heads: Vec<MedusaHeadModule>,
+}
+
+impl MedusaHeadsCandle {
+    /// Build N heads with random init.
+    pub fn from_random(cfg: &MedusaConfig, device: &Device, dtype: DType) -> Result<Self> {
+        let mut heads = Vec::with_capacity(cfg.n_heads);
+        for _ in 0..cfg.n_heads {
+            heads.push(MedusaHeadModule::from_random(cfg, device, dtype)?);
+        }
+        Ok(Self {
+            config: cfg.clone(),
+            heads,
+        })
+    }
+
+    /// Load N heads from local safetensors files.
+    ///
+    /// Expected top-level key layout (FasterDecoding convention):
+    /// `medusa_head.<i>.{res.<j>.{weight,bias}, output.weight}`.
+    pub fn from_safetensors(
+        cfg: &MedusaConfig,
+        paths: &[impl AsRef<Path>],
+        device: &Device,
+        dtype: DType,
+    ) -> Result<Self> {
+        let owned: Vec<_> = paths.iter().map(|p| p.as_ref().to_path_buf()).collect();
+        // Safety: same as Qwen2Decoder::from_paths — files must outlive VB.
+        let vb = unsafe {
+            VarBuilder::from_mmaped_safetensors(&owned, dtype, device).map_err(Error::Candle)?
+        };
+        let mut heads = Vec::with_capacity(cfg.n_heads);
+        for i in 0..cfg.n_heads {
+            heads.push(MedusaHeadModule::from_var_builder(
+                cfg,
+                vb.pp(format!("medusa_head.{i}")),
+            )?);
+        }
+        Ok(Self {
+            config: cfg.clone(),
+            heads,
+        })
+    }
+
+    /// Read-only access to the [`MedusaConfig`].
+    pub fn config(&self) -> &MedusaConfig {
+        &self.config
+    }
+
+    /// Apply each head to the same hidden state, returning one logit tensor
+    /// per head.
+    pub fn forward(&self, hidden: &Tensor) -> Result<Vec<Tensor>> {
+        self.heads.iter().map(|h| h.forward(hidden)).collect()
+    }
+
+    /// Compute per-head top-`k` token IDs from a hidden state.
+    ///
+    /// Convenience wrapper around [`Self::forward`] + [`top_k_indices`].
+    pub fn top_k_per_head(&self, hidden: &Tensor, k: usize) -> Result<Vec<Vec<u32>>> {
+        let logits_per_head = self.forward(hidden)?;
+        let mut out = Vec::with_capacity(self.heads.len());
+        for logits in logits_per_head {
+            // logits dims: same as hidden's leading + vocab. We expect [vocab]
+            // after squeezing the per-position dim — caller is responsible
+            // for passing in a 1D hidden state.
+            let v = logits
+                .to_dtype(DType::F32)
+                .map_err(Error::Candle)?
+                .to_vec1::<f32>()
+                .map_err(Error::Candle)?;
+            let top: Vec<u32> = top_k_indices(&v, k).into_iter().map(|i| i as u32).collect();
+            out.push(top);
+        }
+        Ok(out)
+    }
+}
+
+/// End-to-end Medusa loop against a real Qwen2 target with candle-backed
+/// heads. Uses [`Qwen2Decoder::tree_logits`] for single-pass tree
+/// verification — much faster than the path-by-path simulation in
+/// [`run_medusa`].
+pub fn run_medusa_real<R>(
+    target: &mut Qwen2Decoder,
+    heads: &MedusaHeadsCandle,
+    skeleton: &MedusaHeads,
+    prompt: &[u32],
+    max_new_tokens: usize,
+    config: &MedusaRunConfig,
+    rng: &mut R,
+) -> Result<Vec<u32>>
+where
+    R: rand::Rng + ?Sized,
+{
+    if heads.config().n_heads != skeleton.len() {
+        return Err(Error::Sampling(format!(
+            "head bundle size ({}) does not match skeleton ({})",
+            heads.config().n_heads,
+            skeleton.len()
+        )));
+    }
+
+    target.reset();
+    Decoder::observe(target, prompt)?;
+
+    let mut generated: Vec<u32> = Vec::with_capacity(max_new_tokens);
+    while generated.len() < max_new_tokens {
+        let root = *Decoder::history(target)
+            .last()
+            .ok_or_else(|| Error::Sampling("Medusa requires non-empty prompt".into()))?;
+
+        // 1. Per-head top-k from the target's most recent hidden state.
+        let hidden = target.last_hidden_state()?;
+        let head_top_k = heads.top_k_per_head(&hidden, config.top_k_per_head)?;
+
+        // 2. Tree from the skeleton's topology rule.
+        let tree = skeleton.build_draft_tree(root, &head_top_k, config.topology)?;
+
+        // 3. Tree verification: single forward, k+1 logit rows.
+        let per_node_logits = target.tree_logits(&tree)?;
+
+        // 4. Walk every root-to-leaf path; track the longest accepted prefix.
+        let mut best_path: Vec<usize> = vec![0];
+        for path in tree.paths() {
+            let accepted_len =
+                walk_and_accept(&path, &tree, &per_node_logits, &config.acceptance, rng);
+            if accepted_len + 1 > best_path.len() {
+                best_path = path[..=accepted_len].to_vec();
+            }
+        }
+
+        // 5. Commit + bonus.
+        let mut committed: Vec<u32> = best_path
+            .iter()
+            .skip(1)
+            .map(|&i| tree.token_at(i))
+            .collect();
+        let deepest_idx = *best_path.last().unwrap();
+        if generated.len() + committed.len() < max_new_tokens {
+            let bonus = sample_argmax_or_categorical(
+                &per_node_logits[deepest_idx],
+                &config.acceptance,
+                rng,
+            )?;
+            committed.push(bonus);
+        }
+
+        if committed.is_empty() {
+            return Err(Error::Sampling(
+                "Medusa round committed zero tokens — would loop forever".into(),
+            ));
+        }
+
+        Decoder::observe(target, &committed)?;
+        generated.extend_from_slice(&committed);
+    }
+
+    generated.truncate(max_new_tokens);
+    Ok(generated)
 }
 
 #[cfg(test)]
