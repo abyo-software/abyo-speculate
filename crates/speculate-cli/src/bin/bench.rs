@@ -74,13 +74,83 @@ struct Args {
     #[arg(long)]
     cpu: bool,
 
-    /// Optional prompt; defaults to a generic chat-style prompt.
+    /// Optional prompt; if set, overrides --task. Default: the prompt
+    /// associated with `--task`.
     #[arg(long)]
     prompt: Option<String>,
+
+    /// Built-in prompt preset. Picks a representative prompt for the bench.
+    #[arg(long, value_enum, default_value_t = TaskArg::Chat)]
+    task: TaskArg,
 
     /// RNG seed for deterministic sampling.
     #[arg(long, default_value_t = 12345)]
     seed: u64,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum TaskArg {
+    /// Open-ended chat / explanation. The original default.
+    Chat,
+    /// Coding task — write a small function.
+    Code,
+    /// Translation task — short paragraph EN → JP.
+    Translation,
+    /// Long-context summary — feeds a longer prompt that exercises the
+    /// KV cache for several hundred tokens before generation.
+    LongContext,
+}
+
+impl TaskArg {
+    fn prompt(self) -> &'static str {
+        match self {
+            TaskArg::Chat => {
+                "Write a short, clear summary of how speculative decoding accelerates language \
+                 model inference, in plain English suitable for a senior software engineer who \
+                 has not specialized in ML. Cover the draft+verify pattern and where it falls short."
+            }
+            TaskArg::Code => {
+                "Write a Rust function that takes a slice of f32 and returns the indices of the \
+                 top-k largest elements, using a min-heap of fixed size k. Stable on ties: lowest \
+                 index wins. Include rustdoc and a unit test."
+            }
+            TaskArg::Translation => {
+                "Translate the following paragraph from English to Japanese, preserving tone and \
+                 paragraph structure: \"Speculative decoding accelerates language-model inference \
+                 by having a small draft model propose the next several tokens, which the larger \
+                 target model then verifies in parallel. Most accepted tokens come for free; the \
+                 rejected ones get re-sampled from the target's distribution.\""
+            }
+            TaskArg::LongContext => {
+                concat!(
+                    "Below is a technical document. After reading it, write a 5-bullet summary.\n\n",
+                    "Document:\n",
+                    "Speculative decoding (SD) is a family of techniques that accelerate ",
+                    "autoregressive language model inference without changing the output ",
+                    "distribution. The core idea, introduced by Leviathan et al. (2023) and ",
+                    "Chen et al. (2023), is to pair a large *target* model with a small, fast ",
+                    "*draft* model. Each round, the draft proposes k continuation tokens. The ",
+                    "target then evaluates all k+1 positions in parallel — that's the speedup ",
+                    "lever, since one parallel forward pass over k+1 tokens costs roughly the ",
+                    "same as one autoregressive step. A modified-rejection sampling rule ",
+                    "decides which draft tokens to accept; rejected tokens are replaced by ",
+                    "samples from the target's adjusted distribution. The math guarantees that ",
+                    "the resulting trajectory is distributed identically to plain target ",
+                    "sampling, so SD is a pure efficiency optimization.\n\n",
+                    "Several refinements followed. Medusa (Cai et al. 2024) trades the separate ",
+                    "draft model for a small set of auxiliary heads attached to the target — ",
+                    "each head predicts a future token from the same hidden state. EAGLE (Li ",
+                    "et al. 2024-2025) further improves draft quality by feeding the target's ",
+                    "internal hidden states into the draft, rather than rerunning the draft ",
+                    "model from scratch. SAGUARO (2026) layers two-stage speculation. All of ",
+                    "these techniques shine on single-user (batch=1) inference and degrade as ",
+                    "batch size grows, because at high batch sizes the GPU is already saturated ",
+                    "and the draft+verify pattern can't add throughput.\n\n",
+                    "Now write the 5-bullet summary:"
+                )
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -274,13 +344,6 @@ fn summary(label: &str, results: &[RunResult]) {
     );
 }
 
-fn default_prompt() -> String {
-    "Write a short, clear summary of how speculative decoding accelerates language model \
-     inference, in plain English suitable for a senior software engineer who has not \
-     specialized in ML. Cover the draft+verify pattern and where it falls short."
-        .to_string()
-}
-
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -301,7 +364,11 @@ fn main() -> Result<()> {
         device, dtype, args.target, args.draft
     );
 
-    let prompt_text = args.prompt.unwrap_or_else(default_prompt);
+    let custom_prompt = args.prompt.is_some();
+    let prompt_text = args
+        .prompt
+        .clone()
+        .unwrap_or_else(|| args.task.prompt().to_string());
     let max_new = args.max_tokens;
     let temperature = args.temperature;
     let top_p = args.top_p;
@@ -402,9 +469,28 @@ fn main() -> Result<()> {
         eprintln!(
             "\n=== speedup ===\nautoregressive : {ar:.2} tok/s\nvanilla SD     : {sd:.2} tok/s\nratio          : {speedup:.2}x"
         );
+        let task_label = if custom_prompt {
+            "custom"
+        } else {
+            match args.task {
+                TaskArg::Chat => "chat",
+                TaskArg::Code => "code",
+                TaskArg::Translation => "translation",
+                TaskArg::LongContext => "long_context",
+            }
+        };
         println!(
-            r#"{{"target":"{}","draft":"{}","ar_tok_per_sec":{:.4},"sd_tok_per_sec":{:.4},"sd_speedup":{:.4},"max_tokens":{},"draft_lookahead":{},"temperature":{},"top_p":{}}}"#,
-            args.target, args.draft, ar, sd, speedup, max_new, lookahead, temperature, top_p
+            r#"{{"target":"{}","draft":"{}","task":"{}","ar_tok_per_sec":{:.4},"sd_tok_per_sec":{:.4},"sd_speedup":{:.4},"max_tokens":{},"draft_lookahead":{},"temperature":{},"top_p":{}}}"#,
+            args.target,
+            args.draft,
+            task_label,
+            ar,
+            sd,
+            speedup,
+            max_new,
+            lookahead,
+            temperature,
+            top_p
         );
     }
 

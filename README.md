@@ -63,20 +63,21 @@ let engine = SpeculateEngine::preset_for("qwen-2.5-7b")?;
 
 ## Honest benchmarks
 
-First measured speedup on RTX 4070 Ti SUPER (BF16, 128 tokens, k = 4):
+Measured on RTX 4070 Ti SUPER (BF16, 128 tokens, k = 4, Qwen 2.5 3B target +
+Qwen 2.5 0.5B draft):
 
-| Target | Draft | AR tok/s | SD tok/s | Speedup |
-|--------|-------|---------:|---------:|--------:|
-| Qwen 2.5 1.5B | Qwen 2.5 0.5B | 60.4 | 59.7 | 0.99× |
-| **Qwen 2.5 3B** | **Qwen 2.5 0.5B** | **34.3** | **49.0** | **1.43×** |
-| Qwen 2.5 7B | Qwen 2.5 0.5B | 18.5 | OOM* | N/A |
+| Task | AR tok/s | SD tok/s | Speedup |
+|------|---------:|---------:|--------:|
+| chat | 34.0 | 48.5 | **1.42×** |
+| **code** | **33.9** | **59.8** | **1.76×** |
+| translation | 33.8 | 47.2 | **1.40×** |
+| long_context | 31.2 | 48.2 | **1.55×** |
 
-\* 7B target + 0.5B draft both in BF16 don't fit alongside attention buffers
-on a 16 GB card.
-
-We do **not** quote a single headline ratio — see [`BENCHMARKS.md`](./BENCHMARKS.md)
-for the full table including a `draft_lookahead` sweep, reproducer commands,
-and the cases where SD currently does not help.
+Code generation has the highest speedup — its tokens are the most
+predictable. We do **not** quote a single headline ratio — see
+[`BENCHMARKS.md`](./BENCHMARKS.md) for the full table including model-pair
+sweeps, `draft_lookahead` sweeps, Llama numbers, Medusa loader-compat
+notes, and the cases where SD currently does not help.
 
 ## Building
 
@@ -97,6 +98,7 @@ Minimum Rust version: **1.82** (stable).
 
 - [`abyo_speculate_plan.md`](./abyo_speculate_plan.md) — strategy, risks, competitive analysis, multi-phase plan.
 - [`ARCHITECTURE.md`](./ARCHITECTURE.md) — code layout, design decisions, what's deferred to follow-up sessions.
+- [`CHANGELOG.md`](./CHANGELOG.md) — release notes.
 
 ## License
 

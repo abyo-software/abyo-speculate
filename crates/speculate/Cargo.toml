@@ -1,6 +1,6 @@
 [package]
 name = "abyo-speculate"
-description = "Pure Rust Speculative Decoding library for local LLMs — Medusa / EAGLE-2/3 / vanilla SD with batch-1 optimization"
+description = "Pure Rust Speculative Decoding library for local LLMs — vanilla SD + Medusa, Qwen2 + Llama, batch-1 optimised"
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
@@ -8,6 +8,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
+documentation = "https://docs.rs/abyo-speculate"
 readme.workspace = true
 keywords.workspace = true
 categories.workspace = true
