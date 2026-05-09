@@ -6,40 +6,54 @@ build-out so future sessions can pick up cold. Treat it as a partner to
 *why* we are building this, this document describes *how* the code is
 organised.
 
-## Crate layout
+## Crate layout (v0.1.0)
 
 ```
 abyo-speculate/
 ├── crates/
-│   ├── speculate/                 # the library
+│   ├── speculate/                       # the library
 │   │   ├── src/
-│   │   │   ├── lib.rs             # public re-exports + module roster
-│   │   │   ├── error.rs           # crate Error / Result
-│   │   │   ├── device.rs          # CPU / CUDA / Metal selection
-│   │   │   ├── engine.rs          # SpeculateEngine + builder + dispatch
-│   │   │   ├── presets.rs         # Llama / Qwen / Mistral / Phi configs
-│   │   │   ├── sampling/
-│   │   │   │   ├── mod.rs
-│   │   │   │   └── tokens.rs      # softmax / top-p / categorical sampler
-│   │   │   ├── cache/
-│   │   │   │   ├── mod.rs
-│   │   │   │   └── rollback.rs    # snapshot / append / commit / rollback
-│   │   │   ├── tree.rs            # DraftTree + tensor mask builders
+│   │   │   ├── lib.rs                   # public re-exports + module roster
+│   │   │   ├── error.rs                 # crate Error / Result
+│   │   │   ├── device.rs                # CPU / CUDA / Metal selection
+│   │   │   ├── engine.rs                # SpeculateEngine + builder +
+│   │   │   │                            #   GenerationOptions + dispatch
+│   │   │   ├── presets.rs               # Llama / Qwen / Mistral / Phi configs
+│   │   │   ├── sampling/{mod,tokens}.rs # softmax / top-p / categorical sampler
+│   │   │   ├── cache/{mod,rollback}.rs  # KV snapshot / append / commit / rollback
+│   │   │   ├── tree.rs                  # DraftTree + tensor mask builders
 │   │   │   ├── methods/
-│   │   │   │   ├── mod.rs         # Method enum
-│   │   │   │   ├── vanilla.rs     # Leviathan SD reference impl
-│   │   │   │   └── medusa.rs      # Cai 2024 reference impl + skeleton
-│   │   │   └── model/
-│   │   │       ├── mod.rs         # Decoder trait
-│   │   │       ├── loader.rs      # ModelSource (HF id / local path)
-│   │   │       ├── mock.rs        # MockDecoder for tests
-│   │   │       └── qwen2.rs       # Qwen 2 / 2.5 real-model impl
+│   │   │   │   ├── mod.rs               # Method enum
+│   │   │   │   ├── vanilla.rs           # Leviathan 2023 reference impl
+│   │   │   │   ├── medusa.rs            # Cai 2024 reference + real-head loaders
+│   │   │   │   └── eagle.rs             # v0.2.0 skeleton + UnsupportedMethod
+│   │   │   ├── model/
+│   │   │   │   ├── mod.rs               # Decoder + TreeDecoder traits
+│   │   │   │   ├── loader.rs            # ModelSource (HF id / local path)
+│   │   │   │   ├── hub.rs               # download helpers + MultiPthBackend
+│   │   │   │   ├── mock.rs              # MockDecoder for tests
+│   │   │   │   ├── qwen2{,_local}.rs    # Qwen 2 / 2.5 BF16/F32 path
+│   │   │   │   ├── quantized_qwen2{,_local}.rs # Q4 / Q5 / Q8 GGUF path
+│   │   │   │   ├── llama{,_local}.rs    # Llama 1/2/3.x; also serves Mistral
+│   │   │   │   └── phi3{,_local}.rs     # Phi-3 / 3.5 (fused QKV + gate-up)
+│   │   │   └── examples/                # simple_generate, vanilla_sd_streaming
+│   │   ├── tests/                       # integration tests, all #[ignore]'d
+│   │   │   ├── with_qwen2_05b.rs        # Qwen 2.5 0.5B end-to-end
+│   │   │   ├── with_tinyllama.rs        # TinyLlama 1.1B (Llama 2 arch)
+│   │   │   ├── with_phi3_mini.rs        # Phi-3 mini 4k Instruct
+│   │   │   ├── with_real_medusa_heads.rs        # FasterDecoding head .pt
+│   │   │   └── with_real_medusa_e2e.rs          # Vicuna + Medusa E2E
 │   │   └── Cargo.toml
-│   └── speculate-cli/             # bench + demo binaries
-│       └── src/bin/{bench,demo}.rs
-├── Cargo.toml                     # workspace
-├── abyo_speculate_plan.md
-└── ARCHITECTURE.md  (this file)
+│   └── speculate-cli/                   # bench binary
+│       └── src/bin/bench.rs
+├── scripts/                             # release helpers
+│   └── convert_pth_to_safetensors.py    # uvx torch + safetensors converter
+├── Cargo.toml                           # workspace
+├── abyo_speculate_plan.md               # original strategy + risk register
+├── ARCHITECTURE.md                      # this file
+├── BENCHMARKS.md                        # reproducible measurements
+├── BLOG_DRAFT.md                        # OSS launch post draft
+└── CHANGELOG.md                         # release notes
 ```
 
 ## Layers, top to bottom
@@ -257,17 +271,25 @@ deferred to Phase 1c.**
 
 ## What is intentionally left for follow-up sessions
 
-| Phase | Item | Why deferred |
-|-------|------|--------------|
-| 1c | Vendor `qwen2.rs` to inject our tree-attention bias | candle's stock model only accepts padding masks |
-| 1c | Wire `RollbackCache` into `Qwen2Decoder` | Currently uses `clear+replay`; needs vendored model first |
-| 1c | `Backend` trait wrapping decoder + tokenizer | Wait until we have ≥2 model families to see the right shape |
-| 1b | Real Medusa head `Decoder` (residual MLP + projection forward) | Needs HF checkpoint loader; the structural glue + reference loop are landed |
-| 1b | HF-hub model + Medusa-head download helper | Trivial to add when first needed |
-| 2b | EAGLE-2 dynamic tree construction | Research-grade implementation; needs careful study of the paper |
-| 2c | EAGLE-3 multi-layer features | Builds on 2b |
-| 3 | SAGUARO | Paper not yet verified (see plan §14 checklist) |
-| n/a | Real-GPU benchmarks | Needs the GPU restored + EAGLE-3 head HF availability |
+## Status snapshot (v0.1.0)
+
+| Item | Status | Notes |
+|------|--------|-------|
+| Vanilla SD (Leviathan 2023) | ✅ shipped | TV distance < 0.025 across 4 mismatch scenarios |
+| Medusa skeleton + reference loop | ✅ shipped | Mock-validated against analytic distributions |
+| Medusa real heads | ✅ shipped | Loader verified against `FasterDecoding/medusa-vicuna-7b-v1.3` |
+| Vendored qwen2_local + Qwen2Decoder | ✅ shipped | Tree decoding + fast KV truncate |
+| Vendored llama_local + LlamaDecoder | ✅ shipped | Llama 1/2/3.x; serves Mistral too |
+| Vendored phi3_local + Phi3Decoder | ✅ shipped | Fused QKV + gate+up MLP |
+| Vendored quantized_qwen2_local + Qwen2QuantDecoder | ✅ shipped | GGUF Q4/Q5/Q8 |
+| `MultiPthBackend` for sharded `.bin` | ✅ shipped | Vicuna + bundled Medusa loadable |
+| `engine.generate(text)` with EOS + streaming | ✅ shipped | `GenerationOptions` + callback |
+| Bench CLI per-task / per-family | ✅ shipped | `--family auto|qwen2|llama|mistral|phi3` |
+| Real Medusa speedup numbers | 🚧 in flight | `tests/with_real_medusa_e2e.rs` runs E2E; bench numbers next |
+| Q4 speedup numbers | 📋 v0.2.0 | Plumbing complete; just needs published GGUF + integration test |
+| EAGLE-2 (Li 2024) | 📋 v0.2.0 | Skeleton in `methods::eagle`; `run_eagle_real` returns `UnsupportedMethod` |
+| EAGLE-3 (Li 2025) | 📋 v0.2.0 | Builds on EAGLE-2 |
+| SAGUARO | 📋 v0.3.0 | Paper still pending verification (see plan §14) |
 
 ## Testing strategy
 
