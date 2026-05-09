@@ -110,53 +110,107 @@ fn llama3_8b_q4_with_eagle_2_speedup() {
     );
     eprintln!("AR text: {ar_text}");
 
-    // 6. EAGLE-2 run loop.
-    eprintln!("\n=== EAGLE-2 ===");
-    let run_cfg = EagleRunConfig {
+    // 6. EAGLE-2 with Cartesian then dynamic tree.
+    eprintln!("\n=== EAGLE-2 (Cartesian, 4×2 = 31 nodes) ===");
+    let cart_cfg = EagleRunConfig {
         top_k_per_step: 2,
-        draft_depth: 2, // draft_depth × 1 lm_head_apply each; quantized lm_head dominates
+        draft_depth: 4,
+        max_tree_nodes: None,
         temperature: 0.0,
         top_p: 1.0,
     };
-    let mut rng = rand::rngs::StdRng::seed_from_u64(12345);
+    let (cart_secs, cart_n) = {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(12345);
+        let t1 = std::time::Instant::now();
+        let out = run_eagle(
+            &mut target,
+            &mut draft,
+            &prompt_ids,
+            n,
+            &cart_cfg,
+            &mut rng,
+        )
+        .unwrap_or_else(|e| {
+            eprintln!("Cart run failed: {e:?}");
+            Vec::new()
+        });
+        let secs = t1.elapsed().as_secs_f64();
+        let text = if out.is_empty() {
+            "(empty)".to_string()
+        } else {
+            target.decode(&out, true).unwrap()
+        };
+        eprintln!(
+            "Cart: {} tokens in {secs:.3}s = {:.2} tok/s",
+            out.len(),
+            out.len() as f64 / secs
+        );
+        eprintln!("Cart text: {text}");
+        (secs, out.len())
+    };
 
-    let t1 = std::time::Instant::now();
-    let med_out = run_eagle(
-        &mut target,
-        &mut draft,
-        &prompt_ids,
-        n,
-        &run_cfg,
-        &mut rng,
-    )
-    .unwrap_or_else(|e| {
-        eprintln!("EAGLE run failed: {e:?}");
-        Vec::new()
-    });
-    if med_out.is_empty() {
-        eprintln!("(EAGLE returned no tokens — see error above)");
-        return;
-    }
-    let med_secs = t1.elapsed().as_secs_f64();
-    let med_text = target.decode(&med_out, true).unwrap();
-    eprintln!(
-        "EAGLE: {} tokens in {med_secs:.3}s = {:.2} tok/s",
-        med_out.len(),
-        med_out.len() as f64 / med_secs
-    );
-    eprintln!("EAGLE text: {med_text}");
+    eprintln!("\n=== EAGLE-2 dynamic (depth=4 k=2 pruned to 16 nodes) ===");
+    let dyn_cfg = EagleRunConfig {
+        top_k_per_step: 2,
+        draft_depth: 4,
+        max_tree_nodes: Some(16),
+        temperature: 0.0,
+        top_p: 1.0,
+    };
+    let (dyn_secs, dyn_n) = {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(12345);
+        let t1 = std::time::Instant::now();
+        let out = run_eagle(
+            &mut target,
+            &mut draft,
+            &prompt_ids,
+            n,
+            &dyn_cfg,
+            &mut rng,
+        )
+        .unwrap_or_else(|e| {
+            eprintln!("Dyn run failed: {e:?}");
+            Vec::new()
+        });
+        let secs = t1.elapsed().as_secs_f64();
+        let text = if out.is_empty() {
+            "(empty)".to_string()
+        } else {
+            target.decode(&out, true).unwrap()
+        };
+        eprintln!(
+            "Dyn16: {} tokens in {secs:.3}s = {:.2} tok/s",
+            out.len(),
+            out.len() as f64 / secs
+        );
+        eprintln!("Dyn16 text: {text}");
+        (secs, out.len())
+    };
 
-    let speedup = (med_out.len() as f64 / med_secs) / (n as f64 / ar_secs);
+    let cart_speedup = if cart_n > 0 {
+        (cart_n as f64 / cart_secs) / (n as f64 / ar_secs)
+    } else {
+        0.0
+    };
+    let dyn_speedup = if dyn_n > 0 {
+        (dyn_n as f64 / dyn_secs) / (n as f64 / ar_secs)
+    } else {
+        0.0
+    };
     println!(
-        r#"{{"target":"Meta-Llama-3-8B-Instruct.Q4_K_M","draft":"EAGLE-LLaMA3-Instruct-8B","method":"eagle-2","ar_tok_per_sec":{:.4},"sd_tok_per_sec":{:.4},"sd_speedup":{:.4},"max_tokens":{n},"draft_depth":{},"top_k_per_step":{}}}"#,
+        r#"{{"target":"Meta-Llama-3-8B-Instruct.Q4_K_M","draft":"EAGLE-LLaMA3-Instruct-8B","method":"eagle-2","ar_tok_per_sec":{:.4},"sd_cart_tok_per_sec":{:.4},"sd_cart_speedup":{:.4},"sd_dyn16_tok_per_sec":{:.4},"sd_dyn16_speedup":{:.4},"max_tokens":{n},"draft_depth":{},"top_k_per_step":{}}}"#,
         n as f64 / ar_secs,
-        med_out.len() as f64 / med_secs,
-        speedup,
-        run_cfg.draft_depth,
-        run_cfg.top_k_per_step,
+        cart_n as f64 / cart_secs.max(1e-9),
+        cart_speedup,
+        dyn_n as f64 / dyn_secs.max(1e-9),
+        dyn_speedup,
+        cart_cfg.draft_depth,
+        cart_cfg.top_k_per_step,
     );
-    eprintln!("\n=== EAGLE-2 speedup: {speedup:.2}× over autoregressive ===");
+    eprintln!(
+        "\n=== EAGLE-2 speedup: Cart {cart_speedup:.2}× | Dyn16 {dyn_speedup:.2}× over AR ==="
+    );
 
     assert!(ar_out.len() == n);
-    assert!(!med_out.is_empty());
+    assert!(cart_n > 0 || dyn_n > 0);
 }
