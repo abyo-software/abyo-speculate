@@ -4,29 +4,28 @@
 //!
 //! candle's `qwen2::ModelForCausalLM::forward` slices to the last position
 //! before applying the LM head, which discards exactly the per-position logits
-//! that SD verification needs. We instead drive `qwen2::Model` directly (which
-//! returns full hidden states `[batch, seq, hidden]`) and apply our own
-//! `lm_head` Linear afterward, so `batched_logits(drafts)` can return one
+//! that SD verification needs. We instead drive [`crate::model::qwen2_local::Model`]
+//! (our vendored variant — see that module's rustdoc) directly and apply our
+//! own `lm_head` Linear afterward, so `batched_logits(drafts)` can return one
 //! distribution per draft position from a single forward pass.
 //!
-//! ## Phase 1 limitations (intentional)
+//! ## Phase 1c (this revision)
 //!
-//! - **Rollback is not yet KV-cache-aware.** `rollback_to` calls
-//!   `model.clear_kv_cache()` and re-observes the surviving prefix. That's
-//!   O(history) per rollback rather than O(rollback distance), which means
-//!   Phase-1a SD on real models is roughly 1× autoregressive speed (no
-//!   speedup) but is verifiably correct. Optimizing this is a Phase-1c task.
-//! - **CPU only is the supported path** for unit testing. CUDA / Metal builds
-//!   compile but require the corresponding cargo feature.
-//! - **Model loading via [`Qwen2Decoder::from_paths`] is offline.** Use
-//!   [`crate::model::loader::ModelSource`] + your own download step (or
-//!   `hf-hub`) to fetch the files first; this struct does not download.
+//! - **Tree decoding** via [`Qwen2Decoder::tree_logits`]: a single forward
+//!   over `DraftTree::tokens()` with the per-position RoPE + 4D attention
+//!   bias built by [`crate::tree::DraftTree::full_attention_bias_4d`].
+//! - **Fast rollback** via the vendored
+//!   [`crate::model::qwen2_local::Model::truncate_kv_cache_to`]: O(1) tensor
+//!   slice per layer instead of clear-and-replay.
+//! - `next_logits` / `batched_logits` similarly truncate-and-replay-one-token
+//!   instead of clearing the entire cache.
 
+use crate::model::qwen2_local::{Config, Model};
 use crate::model::Decoder;
+use crate::tree::DraftTree;
 use crate::{Error, Result};
 use candle_core::{DType, Device, IndexOp, Tensor};
 use candle_nn::{linear_no_bias, Linear, Module, VarBuilder};
-use candle_transformers::models::qwen2::{Config, Model};
 use std::path::Path;
 use tokenizers::Tokenizer;
 
@@ -39,8 +38,8 @@ pub struct Qwen2Decoder {
     device: Device,
     dtype: DType,
     vocab_size: usize,
-    /// All tokens we have advanced the KV cache over. May be longer than
-    /// `history` between `batched_logits` and the subsequent `rollback_to`.
+    /// Mirrors `model.kv_cache_len()`. Maintained explicitly so we can avoid
+    /// querying the model on hot paths.
     cache_len: usize,
 }
 
@@ -84,14 +83,8 @@ impl Qwen2Decoder {
             linear_no_bias(config.hidden_size, config.vocab_size, vb.pp("lm_head"))
                 .map_err(Error::Candle)?
         } else {
-            // Tied: re-use embed_tokens weights. We need them out of the model;
-            // load them via vb.pp("model.embed_tokens").
-            let embed = vb
-                .pp("model")
-                .pp("embed_tokens")
-                .get((config.vocab_size, config.hidden_size), "weight")
-                .map_err(Error::Candle)?;
-            Linear::new(embed, None)
+            // Tied: re-use embed_tokens weights.
+            Linear::new(model.embed_tokens_weight().clone(), None)
         };
 
         let tokenizer = Tokenizer::from_file(tokenizer_path.as_ref())
@@ -126,8 +119,8 @@ impl Qwen2Decoder {
     }
 
     /// Run a forward pass over `tokens` starting at the current cache length.
-    /// Returns logits `[seq_len, vocab]` (batch dim squeezed). Updates the
-    /// internal cache_len bookkeeping.
+    /// Returns logits `[seq_len, vocab]` (batch dim squeezed). Updates
+    /// `cache_len`.
     fn forward_advance(&mut self, tokens: &[u32]) -> Result<Tensor> {
         if tokens.is_empty() {
             return Err(Error::Sampling("forward_advance with empty tokens".into()));
@@ -135,20 +128,17 @@ impl Qwen2Decoder {
         let input = Tensor::new(tokens, &self.device)
             .and_then(|t| t.unsqueeze(0))
             .map_err(Error::Candle)?;
-        // qwen2::Model::forward returns hidden states [b, seq, hidden] for ALL positions.
         let hidden = self
             .model
-            .forward(&input, self.cache_len, None)
+            .forward(&input, self.cache_len)
             .map_err(Error::Candle)?;
         let logits = self.lm_head.forward(&hidden).map_err(Error::Candle)?;
-        // Drop the batch dim → [seq, vocab].
         let logits = logits.i((0, .., ..)).map_err(Error::Candle)?;
         self.cache_len += tokens.len();
         Ok(logits)
     }
 
-    /// Convert a single [vocab] tensor row to host f32. Materializes from
-    /// device → host; only call from non-hot paths.
+    /// Materialize a single `[vocab]` tensor row to host `f32`.
     fn row_to_vec(&self, t: &Tensor) -> Result<Vec<f32>> {
         let t = if t.dtype() == DType::F32 {
             t.clone()
@@ -158,16 +148,84 @@ impl Qwen2Decoder {
         t.to_vec1::<f32>().map_err(Error::Candle)
     }
 
-    /// Truncate the KV cache by clearing it and re-running the prefix. Slow but
-    /// correct. Phase-1c will replace this with a partial-truncation primitive.
-    fn cache_clear_and_replay(&mut self, prefix: &[u32]) -> Result<()> {
-        self.model.clear_kv_cache();
-        self.cache_len = 0;
-        if !prefix.is_empty() {
-            // Re-observe prefix without producing logits we use.
-            let _ = self.forward_advance(prefix)?;
+    /// Tree-decoding forward.
+    ///
+    /// Preconditions:
+    /// - `tree.token_at(0)` must equal `self.history.last()` (the tree is
+    ///   rooted at the most recently committed token).
+    /// - `cache_len == history.len()`.
+    ///
+    /// Postconditions:
+    /// - Returns one `Vec<f32>` per tree node — `out[i]` is the target
+    ///   distribution at the position *after* the path-from-root-to-node-i.
+    /// - `cache_len` and `history` are unchanged. The caller decides which
+    ///   path to commit and calls [`Decoder::observe`] to advance the state.
+    pub fn tree_logits(&mut self, tree: &DraftTree) -> Result<Vec<Vec<f32>>> {
+        if self.history.is_empty() {
+            return Err(Error::Sampling("tree_logits with empty history".into()));
         }
-        Ok(())
+        let last_committed = *self.history.last().unwrap();
+        if tree.token_at(0) != last_committed {
+            return Err(Error::Sampling(format!(
+                "tree root ({}) must equal last committed token ({})",
+                tree.token_at(0),
+                last_committed
+            )));
+        }
+
+        let pre_cache_len = self.cache_len;
+        let pre_history_len = self.history.len();
+        debug_assert_eq!(pre_cache_len, pre_history_len);
+        let prefix_len = pre_cache_len - 1; // cache before the root
+
+        // 1. Drop the root from the cache; we'll feed it back as the first
+        //    tree-input position so its hidden state is computed alongside the
+        //    tree-tail nodes.
+        self.model
+            .truncate_kv_cache_to(prefix_len)
+            .map_err(Error::Candle)?;
+        self.cache_len = prefix_len;
+
+        // 2. Build position_ids: depth-based absolute positions.
+        let positions: Vec<u32> = (0..tree.len())
+            .map(|i| (prefix_len + tree.depth_of(i)) as u32)
+            .collect();
+        let position_tensor =
+            Tensor::from_vec(positions, (tree.len(),), &self.device).map_err(Error::Candle)?;
+
+        // 3. Build attention bias over [prefix | tree].
+        let bias = tree.full_attention_bias_4d(prefix_len, 1, 1, &self.device, self.dtype)?;
+
+        // 4. Build input ids [1, n_tree].
+        let input_ids = Tensor::from_slice(tree.tokens(), (1, tree.len()), &self.device)
+            .map_err(Error::Candle)?;
+
+        // 5. Tree-aware forward.
+        let hidden = self
+            .model
+            .forward_with_positions(&input_ids, &position_tensor, &bias)
+            .map_err(Error::Candle)?;
+        // The forward_with_positions path appended n_tree entries to the cache.
+        let logits = self.lm_head.forward(&hidden).map_err(Error::Candle)?;
+        let logits = logits.i((0, .., ..)).map_err(Error::Candle)?; // [n_tree, vocab]
+
+        // 6. Snapshot per-node distributions.
+        let mut out = Vec::with_capacity(tree.len());
+        for i in 0..tree.len() {
+            let row = logits.i((i, ..)).map_err(Error::Candle)?;
+            out.push(self.row_to_vec(&row)?);
+        }
+
+        // 7. Restore cache to its pre-call state: drop the tree, re-feed only
+        //    the root so cache_len returns to pre_cache_len.
+        self.model
+            .truncate_kv_cache_to(prefix_len)
+            .map_err(Error::Candle)?;
+        self.cache_len = prefix_len;
+        let _ = self.forward_advance(&[last_committed])?;
+        debug_assert_eq!(self.cache_len, pre_cache_len);
+
+        Ok(out)
     }
 }
 
@@ -196,31 +254,20 @@ impl Decoder for Qwen2Decoder {
     }
 
     fn next_logits(&mut self) -> Result<Vec<f32>> {
-        // To produce the distribution over the *next* token without committing
-        // it to the cache permanently, we forward a single sentinel-free pass
-        // would normally need a no-op token. Instead we expose the simpler
-        // behavior: callers should `observe` an actual chosen token between
-        // `next_logits` calls, and the SD loop does exactly this.
-        //
-        // We compute logits for "what comes after history.last()" by re-using
-        // the most recent forward's last row. To avoid keeping that around
-        // statefully, we re-forward the last token if needed.
         if self.history.is_empty() {
             return Err(Error::Sampling(
-                "next_logits called with empty history (need a prompt first)".into(),
+                "next_logits called with empty history".into(),
             ));
         }
-        // We need the logits at position history_len - 1. The cache currently
-        // ends at cache_len (== history_len after observe). The last forward
-        // already produced these logits but we discarded them. Re-forward the
-        // last token after rolling the cache back by 1.
+        // Truncate the cache by 1 (drop the last committed token), then
+        // re-forward it to recover its next-token logits. O(1) tensor slice
+        // + 1 forward pass instead of full clear+replay.
         let last = *self.history.last().unwrap();
-        // Roll back the cache by one position, then forward the last token to
-        // recover the logits for the next position.
-        self.model.clear_kv_cache();
-        self.cache_len = 0;
-        let prefix = self.history.clone();
-        let _ = self.forward_advance(&prefix[..prefix.len() - 1])?;
+        let target_len = self.history.len() - 1;
+        self.model
+            .truncate_kv_cache_to(target_len)
+            .map_err(Error::Candle)?;
+        self.cache_len = target_len;
         let logits = self.forward_advance(&[last])?;
         let last_row = logits
             .i((logits.dim(0).map_err(Error::Candle)? - 1, ..))
@@ -230,31 +277,25 @@ impl Decoder for Qwen2Decoder {
 
     fn batched_logits(&mut self, drafts: &[u32]) -> Result<Vec<Vec<f32>>> {
         if drafts.is_empty() {
-            // Just return the next-position logits as a single-element Vec.
             let logits = self.next_logits()?;
             return Ok(vec![logits]);
         }
         if self.history.is_empty() {
-            return Err(Error::Sampling(
-                "batched_logits called with empty history".into(),
-            ));
+            return Err(Error::Sampling("batched_logits with empty history".into()));
         }
 
-        // We need k+1 logit vectors, one for each prefix:
-        //   history, history+drafts[0], ..., history+drafts
-        // Strategy: forward the last_history_token + drafts together, take all
-        // k+1 output rows.
+        // Truncate cache by 1, re-feed [last_committed, drafts...] in one
+        // forward pass to get k+1 logit rows.
         let last = *self.history.last().unwrap();
-        // Reset cache, replay everything except the last history token, then
-        // forward [last, drafts...] in one pass to get k+1 rows.
-        self.model.clear_kv_cache();
-        self.cache_len = 0;
-        let prefix = self.history.clone();
-        let _ = self.forward_advance(&prefix[..prefix.len() - 1])?;
+        let target_len = self.history.len() - 1;
+        self.model
+            .truncate_kv_cache_to(target_len)
+            .map_err(Error::Candle)?;
+        self.cache_len = target_len;
         let mut combined: Vec<u32> = Vec::with_capacity(1 + drafts.len());
         combined.push(last);
         combined.extend_from_slice(drafts);
-        let logits = self.forward_advance(&combined)?; // [k+1, vocab]
+        let logits = self.forward_advance(&combined)?;
 
         let n_rows = logits.dim(0).map_err(Error::Candle)?;
         debug_assert_eq!(n_rows, drafts.len() + 1);
@@ -264,7 +305,8 @@ impl Decoder for Qwen2Decoder {
             out.push(self.row_to_vec(&row)?);
         }
 
-        // Per the trait contract, leave history positioned as if we observed `drafts`.
+        // Trait contract: history advances by drafts; caller rolls back what
+        // it doesn't keep.
         self.history.extend_from_slice(drafts);
         Ok(out)
     }
@@ -277,8 +319,10 @@ impl Decoder for Qwen2Decoder {
             )));
         }
         self.history.truncate(len);
-        let prefix = self.history.clone();
-        self.cache_clear_and_replay(&prefix)?;
+        self.model
+            .truncate_kv_cache_to(len)
+            .map_err(Error::Candle)?;
+        self.cache_len = len;
         Ok(())
     }
 }

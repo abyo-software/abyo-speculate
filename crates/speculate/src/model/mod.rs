@@ -8,6 +8,7 @@
 pub mod loader;
 pub mod mock;
 pub mod qwen2;
+pub mod qwen2_local;
 
 use crate::Result;
 
