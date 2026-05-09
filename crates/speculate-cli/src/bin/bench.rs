@@ -13,7 +13,7 @@
 //! ```
 
 use abyo_speculate::methods::vanilla::{run_vanilla_sd, VanillaConfig};
-use abyo_speculate::model::hub::download_qwen2_single_shard;
+use abyo_speculate::model::hub::download_qwen2;
 use abyo_speculate::model::qwen2::Qwen2Decoder;
 use abyo_speculate::model::qwen2_local::Config;
 use abyo_speculate::model::Decoder;
@@ -101,14 +101,14 @@ fn pick_device(force_cpu: bool) -> Device {
 }
 
 fn load_qwen2(repo: &str, device: &Device, dtype: DType) -> Result<Qwen2Decoder> {
-    let (config_path, tokenizer_path, weights_path) =
-        download_qwen2_single_shard(repo).with_context(|| format!("downloading {repo}"))?;
+    let (config_path, tokenizer_path, weight_paths) =
+        download_qwen2(repo).with_context(|| format!("downloading {repo}"))?;
     let config_json = std::fs::read_to_string(&config_path)?;
     let config: Config = serde_json::from_str(&config_json)
         .with_context(|| format!("parsing config.json from {repo}"))?;
     Qwen2Decoder::from_paths(
         &config,
-        &[weights_path],
+        &weight_paths,
         &tokenizer_path,
         device.clone(),
         dtype,

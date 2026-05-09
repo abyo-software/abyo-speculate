@@ -26,8 +26,10 @@ candle-transformers = { version = "0.8", default-features = false }
 # Tokenization
 tokenizers = { version = "0.20", default-features = false, features = ["onig"] }
 
-# Model download (sync API via ureq — `tokio` feature is async-only)
-hf-hub = { version = "0.3", default-features = false, features = ["online"] }
+# Model download (sync API via ureq — `tokio` feature is async-only).
+# 0.4+ fixed a URL-parse bug for 307 redirects from huggingface.co; that
+# release also renamed the sync-only feature from `online` to `ureq`.
+hf-hub = { version = "0.4", default-features = false, features = ["ureq", "rustls-tls"] }
 
 # Async / runtime
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
