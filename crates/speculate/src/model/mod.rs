@@ -6,6 +6,7 @@
 //! disturbing the SD verification loop.
 
 pub mod loader;
+pub mod mock;
 
 use crate::Result;
 use candle_core::Tensor;
