@@ -29,22 +29,37 @@ abyo-speculate provides multiple Speculative Decoding (SD) algorithms behind a u
 
 ```rust
 use abyo_speculate::{SpeculateEngine, Method};
+use abyo_speculate::model::qwen2::Qwen2Decoder;
 
-let engine = SpeculateEngine::builder()
-    .target_model("llama-3.1-8b-instruct")
-    .method(Method::Medusa)
-    .draft_path("path/to/medusa-llama-3.1-8b")
+// 1. Configure (no I/O yet).
+let mut engine = SpeculateEngine::builder()
+    .target_model("Qwen/Qwen2.5-7B-Instruct")
+    .draft_model("Qwen/Qwen2.5-0.5B-Instruct")
+    .method(Method::Vanilla)
+    .draft_lookahead(4)
     .build()?;
 
-let output = engine.generate("Hello, world!", 200)?;
-println!("{}", output);
+// 2. Load decoders (CPU example shown; CUDA/Metal via crate features).
+let target = Qwen2Decoder::from_paths(/* config, weights, tokenizer */)?;
+let draft  = Qwen2Decoder::from_paths(/* ... */)?;
+engine = engine.with_target(target).with_draft(draft);
+
+// 3. Generate. Tokenize via the underlying decoder; keep this crate
+//    tokenizer-agnostic for now.
+let prompt_ids = vec![/* tokenized prompt */];
+let out_ids = engine.generate_tokens(&prompt_ids, 200)?;
 ```
 
-Or use a one-liner preset:
+Preset shortcut for known model families:
 
 ```rust
-let engine = SpeculateEngine::preset_for("llama-3.1-8b")?;
+let engine = SpeculateEngine::preset_for("qwen-2.5-7b")?;
+// then attach decoders as above.
 ```
+
+> The current builder is *config-only*; you attach loaded decoders with
+> `with_target` / `with_draft`. A higher-level "load everything in one line"
+> helper lands in Phase 1c — see [`ARCHITECTURE.md`](./ARCHITECTURE.md#what-is-intentionally-left-for-follow-up-sessions).
 
 ## Honest benchmarks
 
@@ -73,7 +88,8 @@ Minimum Rust version: **1.82** (stable).
 
 ## Roadmap
 
-See [`abyo_speculate_plan.md`](./abyo_speculate_plan.md) for the full plan, risks, and competitive analysis.
+- [`abyo_speculate_plan.md`](./abyo_speculate_plan.md) — strategy, risks, competitive analysis, multi-phase plan.
+- [`ARCHITECTURE.md`](./ARCHITECTURE.md) — code layout, design decisions, what's deferred to follow-up sessions.
 
 ## License
 
