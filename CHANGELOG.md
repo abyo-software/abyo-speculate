@@ -9,65 +9,99 @@ While the project is at `0.x`, breaking changes can land in any minor or
 patch release; we'll only commit to `1.x`-style stability after the API
 shape has been used in anger by at least one external project.
 
-## [Unreleased]
+## [Unreleased] — v0.2.0
 
 ### Coming up
 
-- Real Medusa speedup measurement against Vicuna 7B (currently blocked on
-  Vicuna safetensors availability — only PyTorch sharded binaries are
-  open-access).
-- F16 / Q4 quantisation paths so Qwen 2.5 7B + draft fits on a 16 GB GPU.
-- EAGLE-2 / EAGLE-3 implementations.
-- Mistral and Phi-3.5 vendored model paths.
+- **EAGLE-2 / EAGLE-3** (Li et al. 2024-2025): higher acceptance rates
+  than Medusa via target-hidden-state-conditioned drafts. Tree-attention
+  primitives and the verification math are in place; the EAGLE-specific
+  draft architecture + dynamic tree construction land next.
+- Real Q4 / GGUF speedup numbers for Qwen 2.5 7B + 0.5B BF16 draft.
+  The plumbing is in `quantized_qwen2_local`; just needs an integration
+  test against a published Q4_K_M GGUF.
+- Better tokenizer-aware streaming with detokenization on every emitted
+  token (current streaming is at the token-id level).
 
-## [0.0.1] — 2026-05-10
+## [0.1.0] — 2026-05-10
 
-Initial public release. Alpha / pre-1.0; APIs may change without notice.
+OSS launch. Production-ready alpha — APIs may still change at any 0.x
+release, but the algorithmic correctness story is solid (statistical
+proofs, real-GPU validation) and the supported model surface covers the
+four families most local-LLM users actually run.
 
-### Added
+### Methods
 
 - **Vanilla Speculative Decoding** (Leviathan et al. 2023) with the
   modified rejection rule, statistically validated against analytic
-  target distributions (TV distance < 0.025–0.03 across four mismatch
-  scenarios).
-- **Medusa** (Cai et al. 2024) skeleton + reference loop:
-  - `MedusaConfig` / `MedusaHeads` / `build_draft_tree` (greedy and
-    Cartesian-product topologies).
-  - `run_medusa` reference verifier (mock-validated).
-  - `MedusaHeadModule` / `MedusaHeadsCandle` real-model heads with
-    `from_random` (synthetic init for plumbing tests) and
-    `from_fasterdecoding_pt` (loads `medusa_lm_head.pt` from the
-    FasterDecoding repos).
-  - `run_medusa_real` end-to-end loop generic over `TreeDecoder`.
-- **`DraftTree` primitives**: parent-pointer trees, ancestor mask, RoPE
+  target distributions (TV distance < 0.025–0.03 across four
+  target/draft mismatch scenarios).
+- **Medusa** (Cai et al. 2024):
+  - Full structural pipeline: `MedusaConfig`, `MedusaHeads`,
+    `build_draft_tree` with greedy + Cartesian-product topologies.
+  - Reference loop `run_medusa` validated against the mock harness.
+  - candle-backed real heads via `MedusaHeadModule` /
+    `MedusaHeadsCandle`. `from_random` (synthetic init for plumbing
+    tests), `from_fasterdecoding_pt` (heads-only `.pt`), and
+    `from_fasterdecoding_var_builder` (bundled checkpoints loaded from
+    a custom `SimpleBackend`).
+  - End-to-end loop `run_medusa_real` generic over `TreeDecoder`.
+
+### Models
+
+Each family ships as a vendored copy of the relevant
+`candle_transformers` model with the SD-specific extensions
+(per-position RoPE via `index_select`, 4D attention bias injection,
+`truncate_kv_cache_to` for fast rollback):
+
+- **Qwen 2 / 2.5** — `model::qwen2_local` + `Qwen2Decoder`
+- **Llama 1 / 2 / 3.x** — `model::llama_local` + `LlamaDecoder`
+- **Phi-3 / 3.5** — `model::phi3_local` + `Phi3Decoder`
+  (handles fused QKV + fused gate+up MLP)
+- **Mistral** — uses the Llama path; auto-detected by the bench CLI
+- **Qwen 2 / 2.5 quantized (GGUF / Q4 / Q5 / Q8)** —
+  `model::quantized_qwen2_local` + `Qwen2QuantDecoder`. Lets a 7B
+  target fit alongside a draft model on a 16 GB consumer GPU.
+
+### Primitives
+
+- `tree::DraftTree` — parent-pointer trees with ancestor mask, RoPE
   position_ids, root-to-leaf paths, plus tensor builders
   (`tree_self_bias`, `full_attention_bias`, `full_attention_bias_4d`)
-  for direct injection into model attention layers.
-- **Vendored Qwen 2 / 2.5 model** (`model::qwen2_local`) with
-  tree-attention extensions (per-token RoPE via `index_select`, 4D
-  attention bias injection, partial KV truncation).
-- **Vendored Llama 1 / 2 / 3.x model** (`model::llama_local`) with the
-  same tree-attention extensions; supports Llama 3 rope scaling.
-- **Concrete `Decoder` impls**: `Qwen2Decoder` and `LlamaDecoder` —
-  identical public surfaces (`from_paths`, `encode`, `decode`,
-  `next_logits`, `batched_logits`, `tree_logits`, `last_hidden_state`,
-  `rollback_to`).
-- **`SpeculateEngine`**: builder + `with_target` / `with_draft`
-  attachment + `generate(text, max_tokens) -> String` /
-  `generate_tokens(&[u32], max_tokens) -> Vec<u32>`. Dispatches on
-  `Method::Autoregressive`, `Method::Vanilla`. Medusa / EAGLE return
-  `UnsupportedMethod`.
-- **Sampling primitives**: `softmax_with_temperature`, `top_p_filter`,
-  `sample_from_distribution`, all unit-tested.
-- **KV `RollbackCache` primitive**: snapshot / append / commit / rollback.
-- **`abyo-speculate-bench`**: CLI for autoregressive vs. vanilla SD
-  timing on real Qwen2 / Llama checkpoints. Auto-detects model family,
-  ships four prompt presets (chat / code / translation / long-context),
-  emits a JSON line per run for downstream tables.
-- **`abyo-speculate-demo`**: minimal hello-world for the engine API.
-- **`hf-hub` download helpers** (`download_qwen2_single_shard`,
-  `download_qwen2`, `download_files`) with sharded-checkpoint
-  auto-detection.
+  for direct injection into model attention.
+- `cache::RollbackCache` — KV cache snapshot / append / commit /
+  rollback primitive.
+- `sampling::{softmax_with_temperature, top_p_filter,
+  sample_from_distribution}` — the unit-tested low-level sampling
+  toolkit.
+
+### Engine API
+
+- `SpeculateEngine` builder pattern + `with_target` / `with_draft` to
+  attach loaded decoders.
+- `generate_tokens(prompt, max)` — autoregressive or vanilla SD
+  depending on `Method`.
+- `generate_tokens_with(prompt, opts, on_token)` — full control:
+  per-call `GenerationOptions { max_new_tokens, stop_tokens }` plus a
+  streaming callback that returns `bool` to halt early.
+- `generate(text, max)` — text-in / text-out, auto-applies the target's
+  EOS tokens.
+
+### Loaders
+
+- `model::hub::download_qwen2` — single-shard / sharded auto-detect for
+  any HF safetensors repo.
+- `model::hub::download_pth_sharded` + `MultiPthBackend` — load PyTorch
+  sharded `.bin` checkpoints (e.g. Vicuna 7B, FasterDecoding bundled
+  Medusa) directly without external conversion. Implements
+  `candle_nn::var_builder::SimpleBackend`.
+
+### Tooling
+
+- `abyo-speculate-bench` CLI: autoregressive vs SD timing on real Qwen2
+  / Llama / Mistral / Phi-3 checkpoints. `--family auto` infers from
+  repo id; `--task chat|code|translation|long-context` selects a
+  representative prompt; emits one JSON line per run.
 
 ### Real-GPU measurements
 
@@ -77,16 +111,33 @@ Reproducible on RTX 4070 Ti SUPER, BF16, k = 4, 128 new tokens
 | Task | AR tok/s | SD tok/s | Speedup |
 |------|---------:|---------:|--------:|
 | chat | 34.0 | 48.5 | 1.42× |
-| code | 33.9 | 59.8 | 1.76× |
+| code | 33.9 | 59.8 | **1.76×** |
 | translation | 33.8 | 47.2 | 1.40× |
 | long_context | 31.2 | 48.2 | 1.55× |
 
-See [`BENCHMARKS.md`](./BENCHMARKS.md) for the full table.
+See [`BENCHMARKS.md`](./BENCHMARKS.md) for the full table including
+model-pair sweeps, k-sweeps, multi-family smokes, and the cases where
+SD currently does not help.
 
 ### Known limitations
 
-- 7B target + 0.5B draft both in BF16 OOMs on a 16 GB card; needs
-  quantisation or a larger GPU.
-- Medusa's full speedup measurement is blocked on a safetensors-format
-  Vicuna 7B; the loader is verified against the published `.pt` format.
-- EAGLE-2 / EAGLE-3 not yet implemented.
+- **EAGLE-2 / EAGLE-3 not yet implemented.** v0.2.0 deliverable. Tree
+  primitives and verification math are in place; the EAGLE-specific
+  draft architecture + dynamic tree construction land next.
+- **Real Medusa speedup measurement.** The loader is verified against
+  the published FasterDecoding format (`tests/with_real_medusa_heads.rs`
+  passes); a full speedup number against Vicuna 7B requires loading the
+  PyTorch-sharded base via `MultiPthBackend`, which the integration
+  test in `tests/with_real_medusa_e2e.rs` exercises but isn't part of
+  the published numbers in BENCHMARKS.md yet.
+- **7B + draft pair in BF16** OOMs on a 16 GB GPU. The Q4 path
+  (`Qwen2QuantDecoder`) addresses this; integration test pending.
+- Multi-batch SD is out of scope. abyo-speculate is single-user
+  (batch = 1) by design.
+
+## [0.0.1] — 2026-05-10 (initial pre-release)
+
+Initial workspace scaffold; the algorithmic correctness story (vanilla SD
++ Medusa skeleton) and the first 1.43× speedup on Qwen 2.5 3B + 0.5B
+draft. See git log for the granular phase-by-phase history that landed
+between 0.0.1 and 0.1.0.

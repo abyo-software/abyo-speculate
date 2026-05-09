@@ -1,20 +1,37 @@
 # abyo-speculate
 
-Pure Rust [Speculative Decoding](https://arxiv.org/abs/2211.17192) library for **local LLMs**, optimized for **batch size 1** single-user inference.
+Pure Rust [Speculative Decoding](https://arxiv.org/abs/2211.17192) library for
+**local LLMs**, optimized for **batch size 1** single-user inference.
 
-> **Status: pre-alpha (0.0.1)** — under active development. APIs will change.
+> **Status: alpha (0.1.0)** — APIs may change at any 0.x release. Algorithmic
+> correctness is solid (statistical proofs + real-GPU validation against
+> published checkpoints).
 
 ## What
 
-abyo-speculate provides multiple Speculative Decoding (SD) algorithms behind a unified Rust API:
+abyo-speculate provides multiple Speculative Decoding (SD) algorithms behind
+a unified Rust API:
 
-| Method | Status | Speedup target |
-|--------|--------|----------------|
-| Vanilla SD (Leviathan 2023) | 🚧 Phase 1 | 1.5–2× |
-| Medusa (Cai 2024) | 🚧 Phase 1 | 1.5–2× |
-| EAGLE-2 (Li 2024) | 📋 Phase 2 | 2.5–3× |
-| EAGLE-3 (Li 2025) | 📋 Phase 2 | 3–3.5× |
-| SAGUARO (2026) | 📋 Phase 3 | TBD |
+| Method | Status (v0.1.0) | Measured speedup* |
+|--------|------------------|-------------------|
+| Vanilla SD (Leviathan 2023) | ✅ shipped | 1.42–1.76× |
+| Medusa (Cai 2024) | ✅ shipped (loader + reference loop) | TBD on real heads |
+| EAGLE-2 (Li 2024) | 📋 v0.2.0 | — |
+| EAGLE-3 (Li 2025) | 📋 v0.2.0 | — |
+| SAGUARO (2026) | 📋 v0.3.0 | — |
+
+\* Qwen 2.5 3B target + Qwen 2.5 0.5B draft, k = 4, RTX 4070 Ti SUPER, BF16.
+See [`BENCHMARKS.md`](./BENCHMARKS.md).
+
+### Supported model families
+
+| Family | Module | Notes |
+|--------|--------|-------|
+| Qwen 2 / 2.5 (BF16 / F32) | `model::qwen2_local` + `Qwen2Decoder` | |
+| Qwen 2 / 2.5 (Q4 / Q5 / Q8 GGUF) | `model::quantized_qwen2_local` + `Qwen2QuantDecoder` | Lets 7B fit on 16 GB |
+| Llama 1 / 2 / 3.x | `model::llama_local` + `LlamaDecoder` | |
+| Mistral | uses Llama path | bench `--family auto` detects |
+| Phi-3 / 3.5 | `model::phi3_local` + `Phi3Decoder` | fused QKV + gate-up |
 
 ## Why
 

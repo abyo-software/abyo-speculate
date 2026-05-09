@@ -38,6 +38,6 @@ pub mod presets;
 pub mod sampling;
 pub mod tree;
 
-pub use engine::{SpeculateEngine, SpeculateEngineBuilder};
+pub use engine::{GenerationOptions, SpeculateEngine, SpeculateEngineBuilder};
 pub use error::{Error, Result};
 pub use methods::Method;
