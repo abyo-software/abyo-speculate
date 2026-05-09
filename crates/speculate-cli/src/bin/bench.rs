@@ -14,8 +14,10 @@
 
 use abyo_speculate::methods::vanilla::{run_vanilla_sd, VanillaConfig};
 use abyo_speculate::model::hub::download_qwen2;
+use abyo_speculate::model::llama::LlamaDecoder;
+use abyo_speculate::model::llama_local::LlamaConfig;
 use abyo_speculate::model::qwen2::Qwen2Decoder;
-use abyo_speculate::model::qwen2_local::Config;
+use abyo_speculate::model::qwen2_local::Config as Qwen2Config;
 use abyo_speculate::model::Decoder;
 use abyo_speculate::sampling::{sample_from_distribution, softmax_with_temperature, top_p_filter};
 use anyhow::{Context, Result};
@@ -26,13 +28,19 @@ use rand::SeedableRng;
 #[derive(Debug, Parser)]
 #[command(name = "abyo-speculate-bench", version)]
 struct Args {
-    /// HF target model id (Qwen2 family with single safetensors shard).
+    /// HF target model id.
     #[arg(long, default_value = "Qwen/Qwen2.5-1.5B-Instruct")]
     target: String,
 
-    /// HF draft model id (typically a smaller Qwen2). Required for SD methods.
+    /// HF draft model id (required for SD methods). Must share the target's
+    /// tokenizer / vocabulary (i.e. same family).
     #[arg(long, default_value = "Qwen/Qwen2.5-0.5B-Instruct")]
     draft: String,
+
+    /// Model family. `auto` infers from the repo id (`Qwen/...` → qwen2,
+    /// anything else → llama).
+    #[arg(long, value_enum, default_value_t = FamilyArg::Auto)]
+    family: FamilyArg,
 
     /// Which method(s) to bench.
     #[arg(long, value_enum, default_value_t = MethodArg::Both)]
@@ -85,6 +93,52 @@ enum MethodArg {
     Both,
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum FamilyArg {
+    Auto,
+    Qwen2,
+    Llama,
+}
+
+impl FamilyArg {
+    fn resolve(self, repo: &str) -> Self {
+        match self {
+            FamilyArg::Auto => {
+                if repo.starts_with("Qwen/") || repo.to_lowercase().contains("qwen") {
+                    FamilyArg::Qwen2
+                } else {
+                    FamilyArg::Llama
+                }
+            }
+            other => other,
+        }
+    }
+}
+
+/// Wraps both decoder types behind a single dispatcher so the bench loop
+/// stays family-agnostic. We don't expose this as a public abstraction in
+/// the library — it's a `bin/`-local convenience until the `Backend`
+/// trait stabilises.
+enum AnyDecoder {
+    Qwen2(Qwen2Decoder),
+    Llama(LlamaDecoder),
+}
+
+impl AnyDecoder {
+    fn encode(&self, text: &str, add_special_tokens: bool) -> abyo_speculate::Result<Vec<u32>> {
+        match self {
+            AnyDecoder::Qwen2(d) => d.encode(text, add_special_tokens),
+            AnyDecoder::Llama(d) => d.encode(text, add_special_tokens),
+        }
+    }
+    fn as_decoder(&mut self) -> &mut dyn Decoder {
+        match self {
+            AnyDecoder::Qwen2(d) => d,
+            AnyDecoder::Llama(d) => d,
+        }
+    }
+}
+
 fn pick_device(force_cpu: bool) -> Device {
     if force_cpu {
         return Device::Cpu;
@@ -104,7 +158,7 @@ fn load_qwen2(repo: &str, device: &Device, dtype: DType) -> Result<Qwen2Decoder>
     let (config_path, tokenizer_path, weight_paths) =
         download_qwen2(repo).with_context(|| format!("downloading {repo}"))?;
     let config_json = std::fs::read_to_string(&config_path)?;
-    let config: Config = serde_json::from_str(&config_json)
+    let config: Qwen2Config = serde_json::from_str(&config_json)
         .with_context(|| format!("parsing config.json from {repo}"))?;
     Qwen2Decoder::from_paths(
         &config,
@@ -116,10 +170,35 @@ fn load_qwen2(repo: &str, device: &Device, dtype: DType) -> Result<Qwen2Decoder>
     .with_context(|| format!("loading Qwen2Decoder for {repo}"))
 }
 
+fn load_llama(repo: &str, device: &Device, dtype: DType) -> Result<LlamaDecoder> {
+    let (config_path, tokenizer_path, weight_paths) =
+        download_qwen2(repo).with_context(|| format!("downloading {repo}"))?;
+    let config_json = std::fs::read_to_string(&config_path)?;
+    let hf_config: LlamaConfig = serde_json::from_str(&config_json)
+        .with_context(|| format!("parsing config.json from {repo}"))?;
+    let config = hf_config.into_config(false);
+    LlamaDecoder::from_paths(
+        &config,
+        &weight_paths,
+        &tokenizer_path,
+        device.clone(),
+        dtype,
+    )
+    .with_context(|| format!("loading LlamaDecoder for {repo}"))
+}
+
+fn load_any(repo: &str, family: FamilyArg, device: &Device, dtype: DType) -> Result<AnyDecoder> {
+    match family.resolve(repo) {
+        FamilyArg::Qwen2 => load_qwen2(repo, device, dtype).map(AnyDecoder::Qwen2),
+        FamilyArg::Llama => load_llama(repo, device, dtype).map(AnyDecoder::Llama),
+        FamilyArg::Auto => unreachable!("resolve() never returns Auto"),
+    }
+}
+
 /// Plain autoregressive sampling loop with the same temperature / top-p
 /// settings the SD path uses, so the comparison is apples-to-apples.
 fn run_autoregressive(
-    target: &mut Qwen2Decoder,
+    target: &mut dyn Decoder,
     prompt_ids: &[u32],
     max_new_tokens: usize,
     temperature: f32,
@@ -127,17 +206,17 @@ fn run_autoregressive(
     seed: u64,
 ) -> anyhow::Result<Vec<u32>> {
     target.reset();
-    Decoder::observe(target, prompt_ids)?;
+    target.observe(prompt_ids)?;
     let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
     let mut out = Vec::with_capacity(max_new_tokens);
     for _ in 0..max_new_tokens {
-        let logits = Decoder::next_logits(target)?;
+        let logits = target.next_logits()?;
         let mut probs = softmax_with_temperature(&logits, temperature)?;
         if top_p < 1.0 {
             top_p_filter(&mut probs, top_p)?;
         }
         let tok = sample_from_distribution(&mut rng, &probs)? as u32;
-        Decoder::observe(target, &[tok])?;
+        target.observe(&[tok])?;
         out.push(tok);
     }
     Ok(out)
@@ -232,7 +311,7 @@ fn main() -> Result<()> {
     let runs = args.runs;
 
     eprintln!("loading target...");
-    let mut target = load_qwen2(&args.target, &device, dtype)?;
+    let mut target = load_any(&args.target, args.family, &device, dtype)?;
     let prompt_ids = target.encode(&prompt_text, true)?;
     eprintln!("prompt: {} tokens", prompt_ids.len());
 
@@ -246,13 +325,25 @@ fn main() -> Result<()> {
         eprintln!("\n=== autoregressive baseline ===");
         for w in 0..warmup {
             eprintln!("  [ar] warmup {}", w + 1);
-            let _ =
-                run_autoregressive(&mut target, &prompt_ids, max_new, temperature, top_p, seed)?;
+            let _ = run_autoregressive(
+                target.as_decoder(),
+                &prompt_ids,
+                max_new,
+                temperature,
+                top_p,
+                seed,
+            )?;
         }
         let results = run_method_n_times("ar", runs, || {
             let t0 = std::time::Instant::now();
-            let out =
-                run_autoregressive(&mut target, &prompt_ids, max_new, temperature, top_p, seed)?;
+            let out = run_autoregressive(
+                target.as_decoder(),
+                &prompt_ids,
+                max_new,
+                temperature,
+                top_p,
+                seed,
+            )?;
             Ok(RunResult {
                 tokens_generated: out.len(),
                 elapsed_secs: t0.elapsed().as_secs_f64(),
@@ -265,7 +356,7 @@ fn main() -> Result<()> {
 
     if do_sd {
         eprintln!("\nloading draft...");
-        let mut draft = load_qwen2(&args.draft, &device, dtype)?;
+        let mut draft = load_any(&args.draft, args.family, &device, dtype)?;
         let cfg = VanillaConfig {
             draft_lookahead: lookahead,
             temperature,
@@ -277,8 +368,8 @@ fn main() -> Result<()> {
             eprintln!("  [sd] warmup {}", w + 1);
             let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
             let _ = run_vanilla_sd(
-                &mut target,
-                &mut draft,
+                target.as_decoder(),
+                draft.as_decoder(),
                 &prompt_ids,
                 max_new,
                 &cfg,
@@ -289,8 +380,8 @@ fn main() -> Result<()> {
             let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
             let t0 = std::time::Instant::now();
             let out = run_vanilla_sd(
-                &mut target,
-                &mut draft,
+                target.as_decoder(),
+                draft.as_decoder(),
                 &prompt_ids,
                 max_new,
                 &cfg,

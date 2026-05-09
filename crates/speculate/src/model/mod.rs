@@ -6,6 +6,8 @@
 //! without disturbing the SD verification loop.
 
 pub mod hub;
+pub mod llama;
+pub mod llama_local;
 pub mod loader;
 pub mod mock;
 pub mod qwen2;
