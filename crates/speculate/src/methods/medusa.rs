@@ -490,7 +490,7 @@ pub fn top_k_indices(logits: &[f32], k: usize) -> Vec<usize> {
 // Phase 1b real-model: candle-backed Medusa heads + Qwen2 integration loop.
 // ============================================================================
 
-use crate::model::qwen2::Qwen2Decoder;
+use crate::model::TreeDecoder;
 use candle_core::{DType, Device, Module, Tensor};
 use candle_nn::{linear, linear_no_bias, Linear, VarBuilder};
 use std::path::Path;
@@ -632,6 +632,61 @@ impl MedusaHeadsCandle {
         })
     }
 
+    /// Load N heads from a FasterDecoding-style PyTorch pickle file
+    /// (`medusa_lm_head.pt`).
+    ///
+    /// FasterDecoding's convention is **not** `medusa_head.<i>....`. Their
+    /// key layout, observed from `FasterDecoding/medusa-vicuna-7b-v1.3`, is:
+    ///
+    /// ```text
+    /// <i>.<j>.linear.weight   shape (hidden, hidden)
+    /// <i>.<j>.linear.bias     shape (hidden,)
+    /// <i>.<num_layers>.weight shape (vocab, hidden)        # output proj, no bias
+    /// ```
+    ///
+    /// where `i in 0..n_heads` and `j in 0..num_layers`. The output projection
+    /// sits at index `num_layers` (one past the last residual block).
+    ///
+    /// `cfg.n_heads` selects how many of the file's heads to load (some
+    /// checkpoints store more heads than the corresponding `config.json`
+    /// claims — trust this argument over the config file).
+    pub fn from_fasterdecoding_pt(
+        cfg: &MedusaConfig,
+        path: impl AsRef<Path>,
+        device: &Device,
+        dtype: DType,
+    ) -> Result<Self> {
+        let vb = VarBuilder::from_pth(path.as_ref(), dtype, device).map_err(Error::Candle)?;
+        let mut heads = Vec::with_capacity(cfg.n_heads);
+        for i in 0..cfg.n_heads {
+            let head_vb = vb.pp(i.to_string());
+            let mut res_blocks = Vec::with_capacity(cfg.residual_layers);
+            for j in 0..cfg.residual_layers {
+                let l = linear(
+                    cfg.hidden_size,
+                    cfg.hidden_size,
+                    head_vb.pp(j.to_string()).pp("linear"),
+                )
+                .map_err(Error::Candle)?;
+                res_blocks.push(l);
+            }
+            let output_proj = linear_no_bias(
+                cfg.hidden_size,
+                cfg.vocab_size,
+                head_vb.pp(cfg.residual_layers.to_string()),
+            )
+            .map_err(Error::Candle)?;
+            heads.push(MedusaHeadModule {
+                res_blocks,
+                output_proj,
+            });
+        }
+        Ok(Self {
+            config: cfg.clone(),
+            heads,
+        })
+    }
+
     /// Read-only access to the [`MedusaConfig`].
     pub fn config(&self) -> &MedusaConfig {
         &self.config
@@ -665,12 +720,12 @@ impl MedusaHeadsCandle {
     }
 }
 
-/// End-to-end Medusa loop against a real Qwen2 target with candle-backed
-/// heads. Uses [`Qwen2Decoder::tree_logits`] for single-pass tree
+/// End-to-end Medusa loop against any [`TreeDecoder`] target with
+/// candle-backed heads. Uses `target.tree_logits` for single-pass tree
 /// verification — much faster than the path-by-path simulation in
 /// [`run_medusa`].
-pub fn run_medusa_real<R>(
-    target: &mut Qwen2Decoder,
+pub fn run_medusa_real<T, R>(
+    target: &mut T,
     heads: &MedusaHeadsCandle,
     skeleton: &MedusaHeads,
     prompt: &[u32],
@@ -679,6 +734,7 @@ pub fn run_medusa_real<R>(
     rng: &mut R,
 ) -> Result<Vec<u32>>
 where
+    T: TreeDecoder + ?Sized,
     R: rand::Rng + ?Sized,
 {
     if heads.config().n_heads != skeleton.len() {

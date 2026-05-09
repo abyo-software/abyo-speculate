@@ -4,6 +4,10 @@
 //! filled in alongside the engine, and lives behind the [`Decoder`] trait so
 //! future work (real models, Medusa heads, EAGLE feature draft) can plug in
 //! without disturbing the SD verification loop.
+//!
+//! [`TreeDecoder`] is the additional capability a decoder needs to participate
+//! in tree-attention SD methods (Medusa, EAGLE). Both `Qwen2Decoder` and
+//! `LlamaDecoder` implement it; mock decoders do not.
 
 pub mod hub;
 pub mod llama;
@@ -66,4 +70,22 @@ pub trait Decoder {
     /// the simple Phase-1a path, a `clear_kv_cache` followed by re-observation
     /// of the prefix).
     fn rollback_to(&mut self, len: usize) -> Result<()>;
+}
+
+/// Capability trait for decoders that support tree-attention SD methods
+/// (Medusa, EAGLE). Implementations must:
+///
+/// - Expose the *next-position* hidden state (the input a Medusa head consumes).
+/// - Verify a [`crate::tree::DraftTree`] in a single forward pass and return
+///   one logit row per node. The decoder's `history` and KV cache must be
+///   restored to their pre-call state so the caller can commit the winning
+///   path via [`Decoder::observe`].
+pub trait TreeDecoder: Decoder {
+    /// Hidden state at position `history.len()` (i.e. what comes *after* the
+    /// last committed token). Shape `[hidden_size]`. Cache state restored.
+    fn last_hidden_state(&mut self) -> Result<candle_core::Tensor>;
+
+    /// Per-node next-token logit distributions for `tree`. Output length =
+    /// `tree.len()`. Cache state restored.
+    fn tree_logits(&mut self, tree: &crate::tree::DraftTree) -> Result<Vec<Vec<f32>>>;
 }

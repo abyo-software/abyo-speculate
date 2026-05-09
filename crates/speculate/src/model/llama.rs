@@ -221,6 +221,16 @@ impl LlamaDecoder {
     }
 }
 
+impl crate::model::TreeDecoder for LlamaDecoder {
+    fn last_hidden_state(&mut self) -> Result<Tensor> {
+        LlamaDecoder::last_hidden_state(self)
+    }
+
+    fn tree_logits(&mut self, tree: &DraftTree) -> Result<Vec<Vec<f32>>> {
+        LlamaDecoder::tree_logits(self, tree)
+    }
+}
+
 impl Decoder for LlamaDecoder {
     fn vocab_size(&self) -> usize {
         self.vocab_size

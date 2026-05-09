@@ -275,6 +275,16 @@ impl Qwen2Decoder {
     }
 }
 
+impl crate::model::TreeDecoder for Qwen2Decoder {
+    fn last_hidden_state(&mut self) -> Result<Tensor> {
+        Qwen2Decoder::last_hidden_state(self)
+    }
+
+    fn tree_logits(&mut self, tree: &DraftTree) -> Result<Vec<Vec<f32>>> {
+        Qwen2Decoder::tree_logits(self, tree)
+    }
+}
+
 impl Decoder for Qwen2Decoder {
     fn vocab_size(&self) -> usize {
         self.vocab_size
