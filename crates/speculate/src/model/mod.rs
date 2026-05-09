@@ -16,6 +16,8 @@ pub mod loader;
 pub mod mock;
 pub mod phi3;
 pub mod phi3_local;
+pub mod quantized_qwen2;
+pub mod quantized_qwen2_local;
 pub mod qwen2;
 pub mod qwen2_local;
 
