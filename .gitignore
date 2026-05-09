@@ -3,6 +3,9 @@
 *.pdb
 Cargo.lock.bak
 
+# Claude Code harness state
+.claude/
+
 # Editor / OS
 .vscode/
 .idea/
