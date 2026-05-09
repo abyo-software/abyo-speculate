@@ -77,17 +77,20 @@ rate drops fast enough that wasted draft work outweighs the
 parallelisation. This matches the qualitative analysis in Leviathan et al.
 2023 §3.4.
 
-## Llama smoke
+## Multi-family smoke
 
-Single-model autoregressive baseline (no SD pair available — TinyLlama is
-already the smallest open-access Llama-2-architecture model):
+Single-model autoregressive baseline per supported family:
 
-| Model | AR tok/s |
-|-------|---------:|
-| TinyLlama 1.1B Chat | 77.0 |
+| Model | Family | Params | AR tok/s |
+|-------|--------|-------:|---------:|
+| TinyLlama 1.1B Chat | Llama 2 | 1.1 B | 77.0 |
+| Phi-3 mini 4k Instruct | Phi-3 | 3.8 B | 34.2 |
 
-Confirms the vendored `llama_local` path runs end-to-end against a real
-Llama 2 architecture model on this GPU.
+Mistral support routes through the Llama path (architectures are
+sufficiently compatible — GQA + RoPE + RMSNorm + SwiGLU MLP, with
+Mistral's `sliding_window` field ignored for batch-1 short contexts). No
+dedicated number yet because Mistral 7B + draft pair OOMs on 16 GB BF16;
+follow-up under "what's not in this table" below.
 
 ## Medusa: loader compatibility
 

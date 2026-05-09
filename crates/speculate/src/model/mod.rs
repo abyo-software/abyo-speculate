@@ -14,6 +14,8 @@ pub mod llama;
 pub mod llama_local;
 pub mod loader;
 pub mod mock;
+pub mod phi3;
+pub mod phi3_local;
 pub mod qwen2;
 pub mod qwen2_local;
 

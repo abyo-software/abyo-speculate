@@ -16,6 +16,8 @@ use abyo_speculate::methods::vanilla::{run_vanilla_sd, VanillaConfig};
 use abyo_speculate::model::hub::download_qwen2;
 use abyo_speculate::model::llama::LlamaDecoder;
 use abyo_speculate::model::llama_local::LlamaConfig;
+use abyo_speculate::model::phi3::Phi3Decoder;
+use abyo_speculate::model::phi3_local::Config as Phi3Config;
 use abyo_speculate::model::qwen2::Qwen2Decoder;
 use abyo_speculate::model::qwen2_local::Config as Qwen2Config;
 use abyo_speculate::model::Decoder;
@@ -168,14 +170,25 @@ enum FamilyArg {
     Auto,
     Qwen2,
     Llama,
+    /// Mistral (uses the Llama path — architectures are compatible).
+    Mistral,
+    Phi3,
 }
 
 impl FamilyArg {
     fn resolve(self, repo: &str) -> Self {
         match self {
             FamilyArg::Auto => {
-                if repo.starts_with("Qwen/") || repo.to_lowercase().contains("qwen") {
+                let lower = repo.to_lowercase();
+                if lower.contains("qwen") {
                     FamilyArg::Qwen2
+                } else if lower.contains("phi-3")
+                    || lower.contains("phi3")
+                    || lower.contains("phi-3.5")
+                {
+                    FamilyArg::Phi3
+                } else if lower.contains("mistral") || lower.contains("zephyr") {
+                    FamilyArg::Mistral
                 } else {
                     FamilyArg::Llama
                 }
@@ -192,6 +205,7 @@ impl FamilyArg {
 enum AnyDecoder {
     Qwen2(Qwen2Decoder),
     Llama(LlamaDecoder),
+    Phi3(Phi3Decoder),
 }
 
 impl AnyDecoder {
@@ -199,12 +213,14 @@ impl AnyDecoder {
         match self {
             AnyDecoder::Qwen2(d) => d.encode(text, add_special_tokens),
             AnyDecoder::Llama(d) => d.encode(text, add_special_tokens),
+            AnyDecoder::Phi3(d) => d.encode(text, add_special_tokens),
         }
     }
     fn as_decoder(&mut self) -> &mut dyn Decoder {
         match self {
             AnyDecoder::Qwen2(d) => d,
             AnyDecoder::Llama(d) => d,
+            AnyDecoder::Phi3(d) => d,
         }
     }
 }
@@ -257,10 +273,33 @@ fn load_llama(repo: &str, device: &Device, dtype: DType) -> Result<LlamaDecoder>
     .with_context(|| format!("loading LlamaDecoder for {repo}"))
 }
 
+fn load_phi3(repo: &str, device: &Device, dtype: DType) -> Result<Phi3Decoder> {
+    let (config_path, tokenizer_path, weight_paths) =
+        download_qwen2(repo).with_context(|| format!("downloading {repo}"))?;
+    let config_json = std::fs::read_to_string(&config_path)?;
+    let config: Phi3Config = serde_json::from_str(&config_json)
+        .with_context(|| format!("parsing config.json from {repo}"))?;
+    Phi3Decoder::from_paths(
+        &config,
+        &weight_paths,
+        &tokenizer_path,
+        device.clone(),
+        dtype,
+    )
+    .with_context(|| format!("loading Phi3Decoder for {repo}"))
+}
+
 fn load_any(repo: &str, family: FamilyArg, device: &Device, dtype: DType) -> Result<AnyDecoder> {
     match family.resolve(repo) {
         FamilyArg::Qwen2 => load_qwen2(repo, device, dtype).map(AnyDecoder::Qwen2),
-        FamilyArg::Llama => load_llama(repo, device, dtype).map(AnyDecoder::Llama),
+        // Mistral uses the Llama path — architectures are sufficiently
+        // compatible (GQA, RoPE, RMSNorm, SwiGLU MLP). The `sliding_window`
+        // field on Mistral's config is ignored, which is fine for batch=1
+        // short generations.
+        FamilyArg::Llama | FamilyArg::Mistral => {
+            load_llama(repo, device, dtype).map(AnyDecoder::Llama)
+        }
+        FamilyArg::Phi3 => load_phi3(repo, device, dtype).map(AnyDecoder::Phi3),
         FamilyArg::Auto => unreachable!("resolve() never returns Auto"),
     }
 }
