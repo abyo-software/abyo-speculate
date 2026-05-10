@@ -439,6 +439,18 @@ pub struct EagleRunConfig {
     /// every ancestor needed to keep them connected. v0.2.0-3 dynamic tree.
     /// `None` keeps the full Cartesian tree.
     pub max_tree_nodes: Option<usize>,
+    /// **Strict mode** (v0.4.2+): when `true`, run an additional GEMV-path
+    /// forward of the root token after the multi-position tree forward,
+    /// and use those logits for `per_node_logits[0]`. This restores the
+    /// v0.2.2 invariant `tree_logits[0] argmax == next_logits argmax`,
+    /// guaranteeing the EAGLE trajectory matches the AR baseline exactly
+    /// under greedy acceptance — at the cost of one extra target forward
+    /// per round (~+45 ms on Llama 2 7B BF16).
+    ///
+    /// Default `false`: skip the extra forward, accept the tiny GEMV/GEMM
+    /// precision drift on borderline-argmax prompts. Output is still
+    /// semantically valid; it just may diverge from AR by a token or two.
+    pub strict_root_gemv: bool,
     /// Sampling temperature applied at the target side.
     pub temperature: f32,
     /// Top-p nucleus.
@@ -451,6 +463,7 @@ impl Default for EagleRunConfig {
             top_k_per_step: 2,
             draft_depth: 4,
             max_tree_nodes: None,
+            strict_root_gemv: false,
             temperature: 0.0, // greedy by default — strictest acceptance
             top_p: 1.0,
         }
@@ -584,7 +597,23 @@ where
         // 4. Verify via the EAGLE fast-path: tree forward returns
         //    (logits, hidden) per node and leaves the KV cache populated
         //    with the tree (no restoration forward).
-        let (per_node_logits, _per_node_hidden) = target.tree_logits_keep_kv(&tree)?;
+        // Strict mode (v0.4.2+): capture the GEMV-path root logits
+        // *before* the tree forward invalidates them. They're already
+        // cached on the target as a side effect of the prior `observe`
+        // (initial prompt or bonus). Using them costs zero extra
+        // forwards — just one `next_logits()` call (cache hit).
+        let strict_root_logits: Option<Vec<f32>> = if config.strict_root_gemv {
+            Some(target.next_logits()?)
+        } else {
+            None
+        };
+
+        let (mut per_node_logits, _per_node_hidden) =
+            target.tree_logits_keep_kv(&tree)?;
+
+        if let Some(root_gemv) = strict_root_logits {
+            per_node_logits[0] = root_gemv;
+        }
 
         // 5. Walk paths, greedy acceptance.
         let mut best_path: Vec<usize> = vec![0];
@@ -675,13 +704,20 @@ where
             // children in the tree. If yes, fold the bonus's tree node
             // into the commit path (no observe forward) and pull its
             // hidden from the tree forward output.
+            // The bonus-in-tree shortcut skips the bonus observe (~45 ms)
+            // when target's argmax bonus matches an already-in-tree child of
+            // the deepest accepted node. Disabled in strict mode because
+            // the next round needs `last_logits` cached for the GEMV root
+            // capture — and skipping observe leaves it invalidated, forcing
+            // a slow-path forward there instead. Net effect of strict +
+            // bonus_in_tree was *worse* throughput; keep them separate.
             let mut bonus_in_tree: Option<usize> = None;
-            for n in 1..tree.len() {
-                if tree.parent_of(n) == deepest_idx
-                    && tree.token_at(n) == bonus
-                {
-                    bonus_in_tree = Some(n);
-                    break;
+            if !config.strict_root_gemv {
+                for n in 1..tree.len() {
+                    if tree.parent_of(n) == deepest_idx && tree.token_at(n) == bonus {
+                        bonus_in_tree = Some(n);
+                        break;
+                    }
                 }
             }
             if let Some(bn) = bonus_in_tree {
@@ -838,6 +874,21 @@ mod tests {
         let c = EagleDraftConfig::eagle_llama3_8b();
         let c2 = c.clone();
         assert_eq!(c.hidden_size, c2.hidden_size);
+    }
+
+    #[test]
+    fn run_config_default_strict_off() {
+        let c = EagleRunConfig::default();
+        assert!(!c.strict_root_gemv, "fast mode is the default");
+    }
+
+    #[test]
+    fn run_config_strict_toggle_compiles() {
+        let c = EagleRunConfig {
+            strict_root_gemv: true,
+            ..Default::default()
+        };
+        assert!(c.strict_root_gemv);
     }
 
     #[test]

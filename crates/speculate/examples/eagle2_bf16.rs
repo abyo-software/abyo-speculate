@@ -87,9 +87,7 @@ fn main() -> Result<()> {
     let cfg = EagleRunConfig {
         top_k_per_step: 2,
         draft_depth: 2,
-        max_tree_nodes: None,
-        temperature: 0.0,
-        top_p: 1.0,
+        ..EagleRunConfig::default()
     };
     let mut rng = rand::rngs::StdRng::seed_from_u64(42);
 

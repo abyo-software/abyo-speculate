@@ -116,8 +116,7 @@ fn llama3_8b_q4_with_eagle_2_speedup() {
         top_k_per_step: 2,
         draft_depth: 4,
         max_tree_nodes: None,
-        temperature: 0.0,
-        top_p: 1.0,
+        ..EagleRunConfig::default()
     };
     let (cart_secs, cart_n) = {
         let mut rng = rand::rngs::StdRng::seed_from_u64(12345);
@@ -154,8 +153,7 @@ fn llama3_8b_q4_with_eagle_2_speedup() {
         top_k_per_step: 2,
         draft_depth: 4,
         max_tree_nodes: Some(16),
-        temperature: 0.0,
-        top_p: 1.0,
+        ..EagleRunConfig::default()
     };
     let (dyn_secs, dyn_n) = {
         let mut rng = rand::rngs::StdRng::seed_from_u64(12345);

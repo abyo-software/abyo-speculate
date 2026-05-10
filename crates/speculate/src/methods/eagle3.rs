@@ -522,6 +522,8 @@ pub struct Eagle3RunConfig {
     /// Indices of target layers to feed as low/mid/high features. Defaults
     /// to the published EAGLE-3 LLaMA3.1-8B recipe (`[1, n/2, n-2]`).
     pub layer_indices: [usize; 3],
+    /// See [`crate::methods::eagle::EagleRunConfig::strict_root_gemv`].
+    pub strict_root_gemv: bool,
     pub temperature: f32,
     pub top_p: f32,
 }
@@ -551,6 +553,7 @@ impl Default for Eagle3RunConfig {
             draft_depth: 4,
             max_tree_nodes: None,
             layer_indices: [1, 15, 28], // Llama 3.1 8B published recipe
+            strict_root_gemv: false,
             temperature: 0.0,
             top_p: 1.0,
         }
@@ -696,7 +699,17 @@ where
 
         // 4. Verify via the EAGLE fast path (tree forward, no restoration,
         //    KV stays populated for commit_tree_path below).
-        let (per_node_logits, _per_node_hidden) = target.tree_logits_keep_kv(&tree)?;
+        // Strict mode: capture the GEMV root logits before tree forward
+        // invalidates the cache. Same trick as run_eagle.
+        let strict_root_logits: Option<Vec<f32>> = if config.strict_root_gemv {
+            Some(target.next_logits()?)
+        } else {
+            None
+        };
+        let (mut per_node_logits, _per_node_hidden) = target.tree_logits_keep_kv(&tree)?;
+        if let Some(root_gemv) = strict_root_logits {
+            per_node_logits[0] = root_gemv;
+        }
 
         // 5. Greedy acceptance.
         let mut best_path: Vec<usize> = vec![0];

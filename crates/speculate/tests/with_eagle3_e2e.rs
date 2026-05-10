@@ -123,8 +123,7 @@ fn llama31_8b_q4_with_eagle_3_speedup() {
         draft_depth: 4,
         max_tree_nodes: Some(16),
         layer_indices,
-        temperature: 0.0,
-        top_p: 1.0,
+        ..Eagle3RunConfig::default()
     };
 
     let mut rng = rand::rngs::StdRng::seed_from_u64(12345);
