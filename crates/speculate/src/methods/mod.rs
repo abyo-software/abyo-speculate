@@ -36,8 +36,14 @@ impl Method {
         }
     }
 
-    /// Whether this method requires a separate draft model checkpoint.
+    /// Whether this method requires a separate draft / heads asset
+    /// loaded alongside the target. Medusa counts even though its heads
+    /// aren't a "draft model" in the Leviathan sense — they're still a
+    /// separate artifact that must be attached.
     pub const fn needs_draft_model(self) -> bool {
-        matches!(self, Method::Vanilla | Method::Eagle2 | Method::Eagle3)
+        matches!(
+            self,
+            Method::Vanilla | Method::Medusa | Method::Eagle2 | Method::Eagle3
+        )
     }
 }

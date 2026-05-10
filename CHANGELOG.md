@@ -9,6 +9,68 @@ While the project is at `0.x`, breaking changes can land in any minor or
 patch release; we'll only commit to `1.x`-style stability after the API
 shape has been used in anger by at least one external project.
 
+## [0.5.0] — 2026-05-10
+
+### `SpeculateEngine` dispatches EAGLE-2, EAGLE-3, and Medusa
+
+Previously the engine only knew about `Method::Autoregressive` and
+`Method::Vanilla`; the EAGLE / Medusa methods were accessible only via
+`crate::methods::eagle::run_eagle` / `run_eagle3` / `run_medusa_real`
+direct calls. v0.5.0 plumbs all four SD methods through the unified
+`SpeculateEngine.generate_tokens_with` so callers can write:
+
+```rust
+let mut engine = SpeculateEngine::builder()
+    .target_model(...).draft_model(...)
+    .method(Method::Eagle2).seed(42)
+    .build()?
+    .with_target(target_decoder)
+    .with_eagle_draft(eagle_candle)
+    .eagle_run_config(EagleRunConfig { draft_depth: 2, ..Default::default() });
+
+let out = engine.generate("[INST] ... [/INST]", 64)?;
+```
+
+Mechanical pieces:
+
+- **New `SpeculateDraft` enum** with variants `Vanilla`, `Medusa { heads,
+  skeleton }`, `Eagle2`, `Eagle3` — typed slots for each method's
+  draft asset. The old `with_draft<D: Decoder>(...)` still works
+  (wraps in `SpeculateDraft::Vanilla`).
+- **New builder methods**: `with_eagle_draft(EagleDraftCandle)`,
+  `with_eagle3_draft(Eagle3DraftCandle)`,
+  `with_medusa(MedusaHeadsCandle, MedusaHeads)`. Each sets the
+  engine's `Method` to the matching variant if it isn't already.
+- **Per-method run config overrides**: `eagle_run_config(...)`,
+  `eagle3_run_config(...)`, `medusa_run_config(...)`. Defaults are
+  used unless overridden.
+- **Engine target bound widened to `TreeDecoder`** (supertrait of
+  `Decoder` — every shipped real decoder already implements it). This
+  is what lets the engine dispatch tree-attention methods cleanly.
+  `MockDecoder` got a stub `impl TreeDecoder for MockDecoder {}` so
+  unit tests still work; the new default impls on
+  `last_hidden_state` / `tree_logits` (return `UnsupportedMethod`)
+  mean partial implementations no longer fail at the type level.
+- **`Method::Medusa` now reports `needs_draft_model() == true`** —
+  consistent with how heads are loaded as a separate asset.
+- **`generate_tokens_with` dispatch** branches on `(Method, SpeculateDraft)`
+  and produces a clear `MissingField` error if the method and the
+  attached draft type don't match.
+- **`tests/with_eagle_via_engine.rs`** exercises the new path
+  end-to-end against `NousResearch/Llama-2-7b-chat-hf` BF16 +
+  `yuhuili/EAGLE-llama2-chat-7B`. Output:
+  `Sure! Here is a haiku about the ocean: ... Serenity found` —
+  same as the direct `run_eagle` path, EOS handled via engine stops.
+- USAGE.md gets a v0.5.0 "drive EAGLE via SpeculateEngine" section.
+
+### Compatibility notes
+
+- `with_target` now requires `TreeDecoder` instead of `Decoder`. All
+  shipped decoders already implement it; only purely-custom external
+  `Decoder` impls would need to add a stub `impl TreeDecoder for ... {}`
+  to compile.
+- `with_draft` (the original method) is unchanged for vanilla SD use.
+
 ## [0.4.2] — 2026-05-10
 
 ### EAGLE strict-mode toggle

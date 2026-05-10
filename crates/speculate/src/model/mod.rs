@@ -118,11 +118,28 @@ pub trait Decoder {
 pub trait TreeDecoder: Decoder {
     /// Hidden state at position `history.len()` (i.e. what comes *after* the
     /// last committed token). Shape `[hidden_size]`. Cache state restored.
-    fn last_hidden_state(&mut self) -> Result<candle_core::Tensor>;
+    /// Default impl returns `UnsupportedMethod` — only decoders that
+    /// expose intermediate hidden states (the real-model wrappers like
+    /// `Qwen2Decoder`, `LlamaDecoder`, `LlamaQuantDecoder`, `Phi3Decoder`)
+    /// override this. Decoders without it can still flow through the
+    /// engine for autoregressive / vanilla SD paths.
+    fn last_hidden_state(&mut self) -> Result<candle_core::Tensor> {
+        Err(crate::Error::UnsupportedMethod {
+            method: "last_hidden_state",
+            reason: "this TreeDecoder does not expose hidden states".into(),
+        })
+    }
 
     /// Per-node next-token logit distributions for `tree`. Output length =
-    /// `tree.len()`. Cache state restored.
-    fn tree_logits(&mut self, tree: &crate::tree::DraftTree) -> Result<Vec<Vec<f32>>>;
+    /// `tree.len()`. Cache state restored. Default impl returns
+    /// `UnsupportedMethod`.
+    fn tree_logits(&mut self, tree: &crate::tree::DraftTree) -> Result<Vec<Vec<f32>>> {
+        let _ = tree;
+        Err(crate::Error::UnsupportedMethod {
+            method: "tree_logits",
+            reason: "this TreeDecoder does not implement tree-attention forward".into(),
+        })
+    }
 
     /// Project a hidden state `[batch, seq, hidden]` (or `[batch, hidden]`)
     /// to logits over the model's vocab. Used by EAGLE drafts that share the

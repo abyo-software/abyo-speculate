@@ -112,6 +112,11 @@ impl MockDecoder {
     }
 }
 
+/// Stub `TreeDecoder` so `MockDecoder` can flow through engine paths
+/// that require a `TreeDecoder` bound. Tree-specific methods fall back
+/// to the trait's default `UnsupportedMethod` errors.
+impl super::TreeDecoder for MockDecoder {}
+
 impl super::Decoder for MockDecoder {
     fn vocab_size(&self) -> usize {
         self.vocab_size

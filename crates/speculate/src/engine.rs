@@ -16,11 +16,75 @@
 //! `USAGE.md` Scenarios 6-8 for the direct API.
 
 use crate::{
-    methods::Method,
-    model::{loader::ModelSource, Decoder},
+    methods::{
+        eagle::{EagleDraftCandle, EagleRunConfig},
+        eagle3::{Eagle3DraftCandle, Eagle3RunConfig},
+        medusa::{MedusaHeads, MedusaHeadsCandle, MedusaRunConfig},
+        Method,
+    },
+    model::{loader::ModelSource, Decoder, TreeDecoder},
     sampling::{sample_from_distribution, softmax_with_temperature, top_p_filter},
     Error, Result,
 };
+
+/// A loaded draft for one of the SD methods. Each variant carries the
+/// type the corresponding method expects:
+///
+/// - `Vanilla` — any [`Decoder`] (e.g. a smaller `Qwen2Decoder`).
+/// - `Medusa` — `MedusaHeadsCandle` (real heads) + `MedusaHeads` (skeleton
+///   used to build the verification tree).
+/// - `Eagle2` — `EagleDraftCandle` (the 1-layer EAGLE-1/-2 transformer).
+/// - `Eagle3` — `Eagle3DraftCandle` (multi-layer feature fusion).
+///
+/// You normally don't construct these by hand — use the
+/// [`SpeculateEngine`] builder's `with_*_draft` / `with_medusa` methods.
+pub enum SpeculateDraft {
+    /// Vanilla SD draft: any [`Decoder`].
+    Vanilla(Box<dyn Decoder + Send>),
+    /// Medusa heads + skeleton.
+    Medusa {
+        /// The trained heads (`FasterDecoding/medusa-*` weights).
+        heads: Box<MedusaHeadsCandle>,
+        /// Tree-shape skeleton used to build the verification tree.
+        skeleton: Box<MedusaHeads>,
+    },
+    /// EAGLE-2 draft (`yuhuili/EAGLE-llama2-chat-7B`-style).
+    Eagle2(Box<EagleDraftCandle>),
+    /// EAGLE-3 draft (`yuhuili/EAGLE3-LLaMA3.1-Instruct-8B`-style).
+    Eagle3(Box<Eagle3DraftCandle>),
+}
+
+impl std::fmt::Debug for SpeculateDraft {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SpeculateDraft::Vanilla(_) => f.write_str("SpeculateDraft::Vanilla(_)"),
+            SpeculateDraft::Medusa { .. } => f.write_str("SpeculateDraft::Medusa { .. }"),
+            SpeculateDraft::Eagle2(_) => f.write_str("SpeculateDraft::Eagle2(_)"),
+            SpeculateDraft::Eagle3(_) => f.write_str("SpeculateDraft::Eagle3(_)"),
+        }
+    }
+}
+
+impl SpeculateDraft {
+    fn matches_method(&self, method: Method) -> bool {
+        matches!(
+            (self, method),
+            (SpeculateDraft::Vanilla(_), Method::Vanilla)
+                | (SpeculateDraft::Medusa { .. }, Method::Medusa)
+                | (SpeculateDraft::Eagle2(_), Method::Eagle2)
+                | (SpeculateDraft::Eagle3(_), Method::Eagle3)
+        )
+    }
+
+    fn variant_name(&self) -> &'static str {
+        match self {
+            SpeculateDraft::Vanilla(_) => "Vanilla",
+            SpeculateDraft::Medusa { .. } => "Medusa",
+            SpeculateDraft::Eagle2(_) => "Eagle2",
+            SpeculateDraft::Eagle3(_) => "Eagle3",
+        }
+    }
+}
 
 /// Top-level entry point.
 ///
@@ -30,8 +94,14 @@ use crate::{
 /// [`SpeculateEngine::with_draft`] for the optional draft model).
 pub struct SpeculateEngine {
     config: EngineConfig,
-    target: Option<Box<dyn Decoder + Send>>,
-    draft: Option<Box<dyn Decoder + Send>>,
+    target: Option<Box<dyn TreeDecoder + Send>>,
+    draft: Option<SpeculateDraft>,
+    /// Per-method run configs. Defaults are used unless the caller
+    /// overrides via the builder. Only the one matching `config.method`
+    /// is consulted at dispatch time.
+    eagle_run_config: EagleRunConfig,
+    eagle3_run_config: Eagle3RunConfig,
+    medusa_run_config: MedusaRunConfig,
 }
 
 impl std::fmt::Debug for SpeculateEngine {
@@ -39,7 +109,10 @@ impl std::fmt::Debug for SpeculateEngine {
         f.debug_struct("SpeculateEngine")
             .field("config", &self.config)
             .field("target_loaded", &self.target.is_some())
-            .field("draft_loaded", &self.draft.is_some())
+            .field(
+                "draft",
+                &self.draft.as_ref().map(|d| d.variant_name()),
+            )
             .finish()
     }
 }
@@ -127,16 +200,76 @@ impl SpeculateEngine {
         &self.config
     }
 
-    /// Attach a loaded target [`Decoder`] (e.g. [`crate::model::qwen2::Qwen2Decoder`]).
-    /// Returns `self` for chaining.
-    pub fn with_target<D: Decoder + Send + 'static>(mut self, target: D) -> Self {
+    /// Attach a loaded target. The target must implement
+    /// [`TreeDecoder`] (which is a supertrait of [`Decoder`]); every real
+    /// decoder we ship — `Qwen2Decoder`, `LlamaDecoder`, `Phi3Decoder`,
+    /// `Qwen2QuantDecoder`, `LlamaQuantDecoder` — already does. The
+    /// `TreeDecoder` bound lets the engine dispatch tree-attention SD
+    /// methods (Medusa / EAGLE / EAGLE-3) without an extra plumbing
+    /// layer.
+    pub fn with_target<D: TreeDecoder + Send + 'static>(mut self, target: D) -> Self {
         self.target = Some(Box::new(target));
         self
     }
 
-    /// Attach a loaded draft [`Decoder`].
+    /// Attach a loaded draft `Decoder` for [`Method::Vanilla`] SD. For
+    /// EAGLE / Medusa methods, use [`Self::with_eagle_draft`] /
+    /// [`Self::with_eagle3_draft`] / [`Self::with_medusa`] instead — they
+    /// accept the specialized draft types those methods need.
     pub fn with_draft<D: Decoder + Send + 'static>(mut self, draft: D) -> Self {
-        self.draft = Some(Box::new(draft));
+        self.draft = Some(SpeculateDraft::Vanilla(Box::new(draft)));
+        self
+    }
+
+    /// Attach an EAGLE-2 draft (`yuhuili/EAGLE-llama2-chat-7B`-style).
+    /// Sets the engine's method to [`Method::Eagle2`] if it isn't already.
+    pub fn with_eagle_draft(mut self, draft: EagleDraftCandle) -> Self {
+        self.draft = Some(SpeculateDraft::Eagle2(Box::new(draft)));
+        if self.config.method != Method::Eagle2 {
+            self.config.method = Method::Eagle2;
+        }
+        self
+    }
+
+    /// Attach an EAGLE-3 draft (`yuhuili/EAGLE3-LLaMA3.1-Instruct-8B`-style).
+    /// Sets the engine's method to [`Method::Eagle3`] if it isn't already.
+    pub fn with_eagle3_draft(mut self, draft: Eagle3DraftCandle) -> Self {
+        self.draft = Some(SpeculateDraft::Eagle3(Box::new(draft)));
+        if self.config.method != Method::Eagle3 {
+            self.config.method = Method::Eagle3;
+        }
+        self
+    }
+
+    /// Attach Medusa heads + the skeleton describing the verification
+    /// tree shape. Sets the engine's method to [`Method::Medusa`].
+    pub fn with_medusa(mut self, heads: MedusaHeadsCandle, skeleton: MedusaHeads) -> Self {
+        self.draft = Some(SpeculateDraft::Medusa {
+            heads: Box::new(heads),
+            skeleton: Box::new(skeleton),
+        });
+        if self.config.method != Method::Medusa {
+            self.config.method = Method::Medusa;
+        }
+        self
+    }
+
+    /// Override the EAGLE-2 run config. Only consulted when
+    /// `method == Method::Eagle2`.
+    pub fn eagle_run_config(mut self, cfg: EagleRunConfig) -> Self {
+        self.eagle_run_config = cfg;
+        self
+    }
+
+    /// Override the EAGLE-3 run config.
+    pub fn eagle3_run_config(mut self, cfg: Eagle3RunConfig) -> Self {
+        self.eagle3_run_config = cfg;
+        self
+    }
+
+    /// Override the Medusa run config.
+    pub fn medusa_run_config(mut self, cfg: MedusaRunConfig) -> Self {
+        self.medusa_run_config = cfg;
         self
     }
 
@@ -145,8 +278,11 @@ impl SpeculateEngine {
         if self.target.is_none() {
             return false;
         }
-        if self.config.method.needs_draft_model() && self.draft.is_none() {
-            return false;
+        if self.config.method.needs_draft_model() {
+            match &self.draft {
+                Some(d) if d.matches_method(self.config.method) => {}
+                _ => return false,
+            }
         }
         true
     }
@@ -202,14 +338,20 @@ impl SpeculateEngine {
             }
             Method::Vanilla => {
                 let target = self.target.as_mut().unwrap();
-                let draft = self.draft.as_mut().unwrap();
+                let SpeculateDraft::Vanilla(draft) = self.draft.as_mut().unwrap() else {
+                    return Err(Error::MissingField(
+                        "method=Vanilla but draft is not a vanilla Decoder; \
+                         call with_draft(_) — for EAGLE/Medusa methods use \
+                         with_eagle_draft / with_eagle3_draft / with_medusa.",
+                    ));
+                };
                 let cfg = crate::methods::vanilla::VanillaConfig {
                     draft_lookahead: self.config.draft_lookahead,
                     temperature: self.config.temperature,
                     top_p: self.config.top_p,
                 };
                 crate::methods::vanilla::run_vanilla_sd_with(
-                    target.as_mut(),
+                    target.as_mut() as &mut dyn Decoder,
                     draft.as_mut(),
                     prompt,
                     opts,
@@ -218,21 +360,58 @@ impl SpeculateEngine {
                     on_token,
                 )
             }
-            other => Err(Error::UnsupportedMethod {
-                method: other.name(),
-                reason: format!(
-                    "{} is implemented in `crate::methods::{}` (call run_eagle / run_eagle3 / \
-                     run_medusa_real directly with the appropriate draft / heads). \
-                     Engine-level dispatch is v0.5.0 scope — see CHANGELOG.",
-                    other.name(),
-                    match other {
-                        Method::Medusa => "medusa",
-                        Method::Eagle2 => "eagle",
-                        Method::Eagle3 => "eagle3",
-                        _ => "<unreachable>",
-                    },
-                ),
-            }),
+            Method::Medusa => {
+                let target = self.target.as_mut().unwrap();
+                let SpeculateDraft::Medusa { heads, skeleton } = self.draft.as_mut().unwrap() else {
+                    return Err(Error::MissingField(
+                        "method=Medusa but draft is not Medusa heads; call with_medusa(_, _).",
+                    ));
+                };
+                let out = crate::methods::medusa::run_medusa_real(
+                    target.as_mut(),
+                    heads.as_ref(),
+                    skeleton.as_ref(),
+                    prompt,
+                    opts.max_new_tokens,
+                    &self.medusa_run_config,
+                    &mut rng,
+                )?;
+                stream_and_stop(out, opts, on_token)
+            }
+            Method::Eagle2 => {
+                let target = self.target.as_mut().unwrap();
+                let SpeculateDraft::Eagle2(draft) = self.draft.as_mut().unwrap() else {
+                    return Err(Error::MissingField(
+                        "method=Eagle2 but draft is not an EAGLE-2 draft; call with_eagle_draft(_).",
+                    ));
+                };
+                let out = crate::methods::eagle::run_eagle(
+                    target.as_mut(),
+                    draft.as_mut(),
+                    prompt,
+                    opts.max_new_tokens,
+                    &self.eagle_run_config,
+                    &mut rng,
+                )?;
+                stream_and_stop(out, opts, on_token)
+            }
+            Method::Eagle3 => {
+                let target = self.target.as_mut().unwrap();
+                let SpeculateDraft::Eagle3(draft) = self.draft.as_mut().unwrap() else {
+                    return Err(Error::MissingField(
+                        "method=Eagle3 but draft is not an EAGLE-3 draft; call with_eagle3_draft(_).",
+                    ));
+                };
+                let out = crate::methods::eagle3::run_eagle3(
+                    target.as_mut(),
+                    draft.as_mut(),
+                    prompt,
+                    opts.max_new_tokens,
+                    &self.eagle3_run_config,
+                    &mut rng,
+                )?;
+                stream_and_stop(out, opts, on_token)
+            }
         }
     }
 
@@ -260,16 +439,44 @@ impl SpeculateEngine {
     }
 }
 
+/// Walk the already-generated tokens from a tree-SD method's `Vec<u32>`
+/// output through the engine's per-token streaming callback + stop-token
+/// rules. The tree methods (Medusa / EAGLE / EAGLE-3) emit several tokens
+/// per round and don't natively expose a per-token callback, so we apply
+/// it here at the engine boundary. Returns the (possibly truncated)
+/// committed prefix.
+fn stream_and_stop<F: FnMut(u32) -> bool>(
+    out: Vec<u32>,
+    opts: &GenerationOptions,
+    mut on_token: F,
+) -> Result<Vec<u32>> {
+    let mut emitted = Vec::with_capacity(out.len());
+    for tok in out {
+        emitted.push(tok);
+        if !on_token(tok) || opts.stop_tokens.contains(&tok) {
+            break;
+        }
+    }
+    Ok(emitted)
+}
+
 /// Plain autoregressive generation: sample from `target.next_logits` one token
-/// at a time. Used as the `Method::Autoregressive` baseline.
-fn run_autoregressive<R: rand::Rng + ?Sized, F: FnMut(u32) -> bool>(
-    target: &mut dyn Decoder,
+/// at a time. Used as the `Method::Autoregressive` baseline. Generic over
+/// `Decoder` so it accepts both `dyn Decoder` and `dyn TreeDecoder` (the
+/// latter implements `Decoder` via supertrait).
+fn run_autoregressive<T, R, F>(
+    target: &mut T,
     prompt: &[u32],
     opts: &GenerationOptions,
     config: &EngineConfig,
     rng: &mut R,
     mut on_token: F,
-) -> Result<Vec<u32>> {
+) -> Result<Vec<u32>>
+where
+    T: Decoder + ?Sized,
+    R: rand::Rng + ?Sized,
+    F: FnMut(u32) -> bool,
+{
     target.reset();
     target.observe(prompt)?;
     let mut out = Vec::with_capacity(opts.max_new_tokens);
@@ -391,6 +598,9 @@ impl SpeculateEngineBuilder {
             config,
             target: None,
             draft: None,
+            eagle_run_config: EagleRunConfig::default(),
+            eagle3_run_config: Eagle3RunConfig::default(),
+            medusa_run_config: MedusaRunConfig::default(),
         })
     }
 }

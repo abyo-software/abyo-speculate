@@ -231,6 +231,35 @@ A complete worked example ships at
 cargo run --release --features cuda --example eagle2_bf16
 ```
 
+### v0.5.0 — drive EAGLE / Medusa via SpeculateEngine
+
+You can also dispatch EAGLE-2, EAGLE-3, and Medusa through the
+unified `SpeculateEngine` API (no need to call `run_eagle` /
+`run_eagle3` / `run_medusa_real` directly):
+
+```rust
+let engine = SpeculateEngine::builder()
+    .target_model("NousResearch/Llama-2-7b-chat-hf")
+    .draft_model("yuhuili/EAGLE-llama2-chat-7B")
+    .method(Method::Eagle2)
+    .seed(42)
+    .build()?
+    .with_target(target_llama_decoder)
+    .with_eagle_draft(eagle_candle)
+    .eagle_run_config(EagleRunConfig {
+        top_k_per_step: 2,
+        draft_depth: 2,
+        ..Default::default()
+    });
+
+let out = engine.generate("[INST] ... [/INST]", 64)?;
+```
+
+Same shape for EAGLE-3 (`with_eagle3_draft` + `eagle3_run_config`) and
+Medusa (`with_medusa(heads, skeleton)` + `medusa_run_config`). The
+engine wraps the per-method run loop, applies your stop tokens / EOS,
+and streams tokens through `generate_tokens_with`'s callback.
+
 ## Scenario 8: EAGLE-3 (multi-layer feature fusion)
 
 ```rust
