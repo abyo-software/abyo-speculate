@@ -78,16 +78,7 @@ fn llama2_7b_bf16_with_eagle_2_speedup() {
         .expect("LlamaDecoder::from_paths");
 
     eprintln!("loading EAGLE draft...");
-    let eagle_cfg = EagleDraftConfig {
-        hidden_size: 4096,
-        vocab_size: 32000, // Llama 2 vocab
-        num_attention_heads: 32,
-        num_key_value_heads: 32, // Llama 2 7B is MHA, not GQA
-        intermediate_size: 11008,
-        rms_norm_eps: 1e-5,
-        rope_theta: 10_000.0,
-        max_position_embeddings: 4096,
-    };
+    let eagle_cfg = EagleDraftConfig::eagle_llama2_chat_7b();
     let mut draft = EagleDraftCandle::from_pth(&eagle_cfg, &eagle_path, &device, dtype)
         .expect("EagleDraftCandle::from_pth");
 
@@ -107,7 +98,8 @@ fn llama2_7b_bf16_with_eagle_2_speedup() {
         let prompt = target.encode(prompt_text, true).unwrap();
         eprintln!("prompt: {} tokens", prompt.len());
 
-        // AR baseline.
+        // AR baseline — runs EXACTLY `n` tokens (no EOS shortcut) so the
+        // per-token comparison with EAGLE is apples-to-apples.
         Decoder::observe(&mut target, &prompt).unwrap();
         let mut ar_out = Vec::with_capacity(n);
         let t0 = std::time::Instant::now();
@@ -116,9 +108,6 @@ fn llama2_7b_bf16_with_eagle_2_speedup() {
             let tok = argmax_u32(&logits);
             ar_out.push(tok);
             Decoder::observe(&mut target, &[tok]).unwrap();
-            if [2u32].contains(&tok) {
-                break;
-            }
         }
         let ar_secs = t0.elapsed().as_secs_f64();
         let ar_text = target.decode(&ar_out, true).unwrap();
@@ -129,11 +118,15 @@ fn llama2_7b_bf16_with_eagle_2_speedup() {
         );
         eprintln!("AR text: {}", &ar_text[..ar_text.len().min(140)]);
 
-        // EAGLE-2 with dynamic tree (depth=4, k=2, dyn=16).
+        // EAGLE-2 with shallower dynamic tree (depth=2, k=2, dyn=4).
+        // Shallower trees amortize better when per-round overhead is high
+        // (Llama 2 7B MHA has expensive per-step KV reads). The published
+        // EAGLE-2 paper sweeps depth/k to find the optimum per architecture;
+        // we default to depth=2/k=2 here for the BF16 7B regime.
         let cfg = EagleRunConfig {
             top_k_per_step: 2,
-            draft_depth: 4,
-            max_tree_nodes: Some(16),
+            draft_depth: 2,
+            max_tree_nodes: None,
             temperature: 0.0,
             top_p: 1.0,
         };

@@ -284,8 +284,18 @@ impl LlamaDecoder {
 
     /// Apply the model's lm_head — exposed so EAGLE / EAGLE-3 can re-use
     /// the target's vocab projection without owning a separate copy.
+    /// Auto-promotes the input dtype to match the lm_head weight if needed
+    /// (EAGLE's run loop sometimes passes F32 because the Q4 path requires
+    /// F32 inputs — silently converting here means the same call works
+    /// for both BF16 and Q4 targets).
     pub fn apply_lm_head(&self, hidden: &Tensor) -> Result<Tensor> {
-        self.lm_head.forward(hidden).map_err(Error::Candle)
+        let want = self.dtype;
+        let hidden = if hidden.dtype() != want {
+            hidden.to_dtype(want).map_err(Error::Candle)?
+        } else {
+            hidden.clone()
+        };
+        self.lm_head.forward(&hidden).map_err(Error::Candle)
     }
 
     /// Embed token ids via the target's tied embedding (used by EAGLE-3).

@@ -9,6 +9,62 @@ While the project is at `0.x`, breaking changes can land in any minor or
 patch release; we'll only commit to `1.x`-style stability after the API
 shape has been used in anger by at least one external project.
 
+## [0.3.0] — 2026-05-10
+
+### EAGLE on the architecture it was actually trained for (BF16)
+
+The big v0.2.x finding was that EAGLE-3 + Q4 produces correct output
+(post-v0.2.2 `tree_logits` fix) but ~0.21× speed because the draft was
+trained on FP16 hidden states. v0.3.0 adds the canonical BF16 path:
+
+- **`LlamaDecoder` (`model::llama`) BF16 safetensors path** gains the
+  full TreeDecoder surface: `apply_lm_head`, `last_hidden_states_multi`,
+  `num_hidden_layers`, `embed_tokens`. The same v0.2.2 root-replacement
+  fix is applied to the BF16 path (single-position GEMV vs
+  multi-position GEMM precision drift affects BF16 too, just less
+  often).
+- **`forward_with_layer_hooks`** on `quantized_llama_local::ModelWeights`
+  / `llama_local::Llama` collects residual hidden states at arbitrary
+  layer indices in one forward pass — required by EAGLE-3's
+  low/mid/high feature concat.
+- **`EagleDraftConfig::eagle_llama2_chat_7b()`** preset for the
+  `yuhuili/EAGLE-llama2-chat-7B` checkpoint (Llama 2 7B is MHA, not GQA;
+  RoPE base 10 000; 32k vocab via SentencePiece).
+- **`tests/with_eagle_bf16_e2e.rs`**: end-to-end multi-prompt benchmark
+  for `NousResearch/Llama-2-7b-chat-hf` BF16 (mirrored to dodge the
+  meta-llama gating) + `yuhuili/EAGLE-llama2-chat-7B`. ~15 GB total →
+  fits a 16 GB GPU.
+
+### t2d sampling mask
+
+`Eagle3DraftCandle::t2d_mask` is now derived from `d2t` at load time
+(the published checkpoint stores `t2d` as BoolStorage which candle's
+pickle loader skips, but the value is fully derivable from `d2t`).
+`mask_target_logits()` applies the mask in-place, useful when sampling
+the target distribution under EAGLE-3's reachability constraint.
+
+### Vanilla SD speedups re-validated
+
+Re-measured at v0.3.0 on Qwen 2.5 3B + 0.5B BF16 (RTX 4070 Ti SUPER,
+128 tokens, k=4, mean of 3 runs):
+
+| Task | AR tok/s | SD tok/s | Speedup |
+|------|---------:|---------:|--------:|
+| chat | 34.4 | 49.5 | **1.44×** |
+| code | 35.3 | 61.4 | **1.74×** |
+| translation | 34.1 | 48.0 | **1.41×** |
+| long_context | 31.5 | 49.6 | **1.57×** |
+
+### Quality
+
+- 74 unit + statistical tests pass on CPU.
+- `cargo clippy --all-targets -- -D warnings` clean.
+- `cargo audit` clean (only 2 unmaintained-transitive-dep warnings;
+  `number_prefix` from `indicatif`, `paste` from `gemm`; both passive).
+- New `cargo-audit` step in CI.
+- `CONTRIBUTING.md` added.
+- `scripts/run_benchmarks.sh` for one-line repro of the README table.
+
 ## [0.2.2] — 2026-05-10
 
 ### tree_logits multi-position correctness fix

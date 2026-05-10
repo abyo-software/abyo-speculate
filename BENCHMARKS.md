@@ -147,16 +147,30 @@ understand the Q4 trade-off.
 
 ### EAGLE on BF16 targets — `tests/with_eagle_bf16_e2e.rs`
 
-The canonical EAGLE configuration: BF16 target (no quantization noise)
-+ matching EAGLE-1/-2 checkpoint. We use `NousResearch/Llama-2-7b-chat-hf`
-(13.5 GB safetensors mirror of `meta-llama/Llama-2-7b-chat-hf`, no
-gating) + `yuhuili/EAGLE-llama2-chat-7B`.
+`NousResearch/Llama-2-7b-chat-hf` (13.5 GB safetensors mirror of
+`meta-llama/Llama-2-7b-chat-hf`, no gating) +
+`yuhuili/EAGLE-llama2-chat-7B`. Total GPU footprint: ~15 GB → fits a
+16 GB card.
 
-Total GPU footprint: ~15 GB → fits a 16 GB card.
+3 prompts × 64 tokens, AR forced to same N (no EOS shortcut), EAGLE-2
+depth=2 k=2 (no dynamic prune):
 
-The test runs three prompts through both AR and EAGLE-2 (depth=4,
-k=2, dyn=16) and asserts non-empty output. See latest run for the
-measured ratio (the README headline updates with each v0.x release).
+| Run | AR tok/s | EAGLE tok/s | Speedup |
+|-----|---------:|------------:|--------:|
+| Mean across 3 prompts | 21.2 | 10.3 | **0.49×** |
+
+Greedy acceptance is correct for the first ~20-30 tokens (output
+matches AR byte-for-byte). After that the trajectories diverge — the
+suspected cause is multi-position GEMM precision drift on
+`per_node_logits[i > 0]` cascading once a path commits more than one
+draft token (v0.2.2's root-replacement fix only patches index 0). Worth
+investigating in v0.3.x for the deeper-tree case.
+
+Llama 2 7B is MHA — KV reads are cheap, so AR per-step is fast (~45 ms)
+relative to EAGLE's per-round overhead (~150 ms at depth=2 k=2 + commit
+cost). On GQA architectures (Llama 3 8B BF16 would be ideal) the
+expected math says EAGLE should be 1.5-2× — but Llama 3 8B BF16
+(~16 GB) doesn't leave room for the EAGLE checkpoint on a 16 GB GPU.
 
 ## What's NOT in this table (yet)
 

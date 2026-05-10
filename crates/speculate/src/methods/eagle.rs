@@ -79,6 +79,22 @@ impl EagleDraftConfig {
         }
     }
 
+    /// Defaults for `yuhuili/EAGLE-llama2-chat-7B`. Llama 2 7B is MHA
+    /// (num_kv_heads = num_attention_heads), uses RoPE base 10 000, and
+    /// has a 32 000-entry vocab (SentencePiece, not the Llama 3 BPE).
+    pub fn eagle_llama2_chat_7b() -> Self {
+        Self {
+            hidden_size: 4096,
+            vocab_size: 32_000,
+            num_attention_heads: 32,
+            num_key_value_heads: 32,
+            intermediate_size: 11_008,
+            rms_norm_eps: 1e-5,
+            rope_theta: 10_000.0,
+            max_position_embeddings: 4096,
+        }
+    }
+
     fn head_dim(&self) -> usize {
         self.hidden_size / self.num_attention_heads
     }
@@ -509,14 +525,11 @@ where
         for step in 0..config.draft_depth {
             let draft_hidden =
                 draft.forward(&current_hidden, &current_token_ids, history_len + step)?;
-            // The target's lm_head may be quantized (F32-only input) while
-            // the draft is F16. Promote before applying.
-            let draft_hidden_for_head = if draft_hidden.dtype() != DType::F32 {
-                draft_hidden.to_dtype(DType::F32).map_err(Error::Candle)?
-            } else {
-                draft_hidden.clone()
-            };
-            let logits = target.apply_lm_head(&draft_hidden_for_head)?;
+            // `target.apply_lm_head` auto-promotes the input dtype to match
+            // its lm_head weight (BF16 for `LlamaDecoder`, F32 for the Q4
+            // path on `LlamaQuantDecoder`), so passing the draft's hidden
+            // tensor as-is is dtype-safe here.
+            let logits = target.apply_lm_head(&draft_hidden)?;
             // Take the last position's logits — for a 1-token forward this
             // is just position 0.
             let last = logits
