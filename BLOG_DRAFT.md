@@ -1,3 +1,64 @@
+# abyo-speculate v0.2.0 — EAGLE-2 / EAGLE-3 wired against published checkpoints
+
+*v0.2.0 release notes draft. Edit before posting.*
+
+## What changed since v0.1.0
+
+- **EAGLE-2** (Li et al. 2024) end-to-end against
+  `yuhuili/EAGLE-LLaMA3-Instruct-8B` with Llama 3 8B Instruct
+  **Q4_K_M GGUF** as the target. Output text matches the AR baseline
+  byte-for-byte (greedy acceptance over the verified target tree).
+- **EAGLE-2 dynamic tree pruning** via `EagleRunConfig::max_tree_nodes` —
+  builds the full Cartesian tree, scores every node by cumulative
+  log-prob, keeps the top-N plus the ancestor closure.
+- **EAGLE-3** (Li et al. 2025) wired against
+  `yuhuili/EAGLE3-LLaMA3.1-Instruct-8B`: 3-layer feature concat
+  (`low / mid / high`), midlayer with `input_layernorm` + `hidden_norm`
+  + 2*hidden attention input, own 32k draft `lm_head`, `d2t` translation
+  back to the target's 128k vocab.
+- New `TreeDecoder::apply_lm_head`, `last_hidden_states_multi`,
+  `num_hidden_layers` trait methods so the EAGLE / EAGLE-3 run loops
+  share the target without duplicate decoders or closure-based
+  plumbing.
+- New `LlamaQuantDecoder` for GGUF Llama families (Llama 2 / 3 / 3.1)
+  with a bundled HF tokenizer and a tree-attention-friendly
+  `forward_with_positions` + `forward_hidden_with_layers`.
+
+## Honest perf data on Q4 8B targets
+
+End-to-end on Llama 3 8B Instruct **Q4_K_M** + EAGLE-2 LLaMA3 draft
+(prompt = "The capital of France is", max_tokens = 32, depth = 4, k = 2):
+
+| variant            | tok/s  | speedup |
+|--------------------|-------:|--------:|
+| Autoregressive     | 45.84  | 1.00×   |
+| EAGLE-2 Cartesian  |  6.62  | 0.14×   |
+| EAGLE-2 Dyn-16     |  8.52  | 0.19×   |
+
+EAGLE-2 is **slower than autoregressive** on Q4 8B targets in this
+configuration. The bottleneck is the per-step
+`target.apply_lm_head`: a Q4 × 128k vocab QMatMul that costs ~50 ms
+per call on this GPU, vs ~22 ms for an entire Q4 target step.
+EAGLE-2's design assumption (target step >> draft per-step overhead)
+breaks under heavy target-side quantization.
+
+EAGLE-3 against Llama 3.1 8B **Q4_K_M** posts 0.21× over AR. Output
+text is coherent ("Paris, which is located in the northern part of the
+country…") but diverges from greedy AR — the trained-recipe layer
+indices and a midlayer normalisation detail need tuning. **v0.2.1
+target**: ≥ 1× on Q4 8B via correct EAGLE-3 wiring (smaller draft
+vocab dodges the per-step Q4 lm_head bottleneck).
+
+## What's still v0.2.1 work
+
+- EAGLE-3 layer-index / midlayer tuning to land a real ≥ 1× on Q4 8B.
+- `t2d` BoolStorage workaround so the sampling-mask path uses the
+  reachable-targets bitmap rather than falling back to "all reachable".
+- Fp16 Llama 3 / 3.1 target on a 24 GB GPU as the canonical benchmark
+  (Q4 is the practical case but not the easiest perf surface for SD).
+
+---
+
 # abyo-speculate v0.1.0 — Pure Rust Speculative Decoding for local LLMs
 
 *A Day-1 launch draft. Edit before posting to HN / r/LocalLLaMA / r/rust.*
