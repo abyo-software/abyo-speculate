@@ -175,6 +175,85 @@ For checkpoints that bundle base + heads (`FasterDecoding/medusa-1.0-vicuna-7b-v
 use `MultiPthBackend` + `from_fasterdecoding_var_builder` — see
 `crates/speculate/tests/with_real_medusa_e2e.rs` for a worked example.
 
+## Scenario 7: EAGLE-2 (target-hidden-conditioned draft)
+
+```rust
+use abyo_speculate::methods::eagle::{
+    run_eagle, EagleDraftCandle, EagleDraftConfig, EagleRunConfig,
+};
+use abyo_speculate::model::hub::{download_files, download_qwen2};
+use abyo_speculate::model::llama::LlamaDecoder;
+use abyo_speculate::model::llama_local::LlamaConfig;
+
+// Target: BF16 Llama-2-7B-Chat (~14 GB on a 16 GB GPU).
+let (config_path, tokenizer_path, weights) =
+    download_qwen2("NousResearch/Llama-2-7b-chat-hf")?;
+let llama_cfg: LlamaConfig =
+    serde_json::from_str(&std::fs::read_to_string(&config_path)?)?;
+let mut target = LlamaDecoder::from_paths(
+    &llama_cfg.into_config(false), &weights, &tokenizer_path,
+    Device::new_cuda(0)?, DType::BF16,
+)?;
+
+// Draft: yuhuili/EAGLE-llama2-chat-7B (~1 GB, 1-layer transformer).
+let eagle_path =
+    download_files("yuhuili/EAGLE-llama2-chat-7B", &["pytorch_model.bin"])?[0]
+        .clone();
+let cfg = EagleDraftConfig {
+    hidden_size: 4096, vocab_size: 32000,
+    num_attention_heads: 32, num_key_value_heads: 32, // Llama 2 7B is MHA
+    intermediate_size: 11008, rms_norm_eps: 1e-5,
+    rope_theta: 10_000.0, max_position_embeddings: 4096,
+};
+let mut draft = EagleDraftCandle::from_pth(&cfg, &eagle_path,
+                                           target.device(), DType::BF16)?;
+
+let run_cfg = EagleRunConfig {
+    top_k_per_step: 2, draft_depth: 4,
+    max_tree_nodes: Some(16), // dynamic tree pruning
+    temperature: 0.0, top_p: 1.0,
+};
+let mut rng = rand::thread_rng();
+let prompt = target.encode("[INST] What is RoPE? [/INST]", true)?;
+let out = run_eagle(&mut target, &mut draft, &prompt, 128, &run_cfg, &mut rng)?;
+println!("{}", target.decode(&out, true)?);
+```
+
+EAGLE drafts are trained on FP16 / BF16 hidden states. Pairing them with
+a **Q4** target works (output is correct via greedy acceptance) but
+acceptance rate falls and you typically end up *slower* than AR — the
+quantization noise pushes draft predictions away from target's argmax.
+
+## Scenario 8: EAGLE-3 (multi-layer feature fusion)
+
+```rust
+use abyo_speculate::methods::eagle3::{
+    run_eagle3, Eagle3DraftCandle, Eagle3DraftConfig, Eagle3RunConfig,
+};
+
+let cfg = Eagle3DraftConfig::eagle3_llama3_1_8b();
+let mut draft = Eagle3DraftCandle::from_pth(
+    &cfg, eagle3_path, target.device(), DType::F16,
+)?;
+
+let run_cfg = Eagle3RunConfig {
+    top_k_per_step: 2, draft_depth: 4,
+    max_tree_nodes: Some(16),
+    layer_indices: Eagle3RunConfig::default_layers_for(target.num_hidden_layers()),
+    temperature: 0.0, top_p: 1.0,
+};
+let mut rng = rand::thread_rng();
+let out = run_eagle3(&mut target, &mut draft, &prompt, 128, &run_cfg, &mut rng)?;
+```
+
+EAGLE-3 reads three hidden states from the target (low / mid / high
+layer outputs), fuses them via `fc(concat) → midlayer → norm → 32k
+draft lm_head`, then translates accepted draft ids back to the target's
+vocab via `d2t`. The default layer triple matches the published training
+recipe (`SafeAILab/EAGLE/eagle/traineagle3/modeling_llama_kv.py`
+line 1139): `[2, n/2, n-3]` (input-of), which in our after-layer-i
+convention is `[1, n/2-1, n-4]` = `[1, 15, 28]` for Llama 3.1 8B.
+
 ## Bench CLI
 
 ```sh

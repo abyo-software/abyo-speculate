@@ -6,7 +6,7 @@ build-out so future sessions can pick up cold. Treat it as a partner to
 *why* we are building this, this document describes *how* the code is
 organised.
 
-## Crate layout (v0.1.0)
+## Crate layout (v0.3.0)
 
 ```
 abyo-speculate/
@@ -26,33 +26,41 @@ abyo-speculate/
 │   │   │   │   ├── mod.rs               # Method enum
 │   │   │   │   ├── vanilla.rs           # Leviathan 2023 reference impl
 │   │   │   │   ├── medusa.rs            # Cai 2024 reference + real-head loaders
-│   │   │   │   └── eagle.rs             # v0.2.0 skeleton + UnsupportedMethod
+│   │   │   │   ├── eagle.rs             # EAGLE-2 (Li 2024) — Cartesian + dynamic tree
+│   │   │   │   └── eagle3.rs            # EAGLE-3 (Li 2025) — multi-layer + d2t/t2d
 │   │   │   ├── model/
-│   │   │   │   ├── mod.rs               # Decoder + TreeDecoder traits
+│   │   │   │   ├── mod.rs               # Decoder + TreeDecoder traits (apply_lm_head,
+│   │   │   │   │                        #   last_hidden_states_multi, embed_tokens)
 │   │   │   │   ├── loader.rs            # ModelSource (HF id / local path)
 │   │   │   │   ├── hub.rs               # download helpers + MultiPthBackend
 │   │   │   │   ├── mock.rs              # MockDecoder for tests
 │   │   │   │   ├── qwen2{,_local}.rs    # Qwen 2 / 2.5 BF16/F32 path
 │   │   │   │   ├── quantized_qwen2{,_local}.rs # Q4 / Q5 / Q8 GGUF path
-│   │   │   │   ├── llama{,_local}.rs    # Llama 1/2/3.x; also serves Mistral
+│   │   │   │   ├── llama{,_local}.rs    # Llama 1/2/3.x BF16 + EAGLE hooks
+│   │   │   │   ├── quantized_llama{,_local}.rs # Llama 2/3/3.1 Q4_K_M GGUF
 │   │   │   │   └── phi3{,_local}.rs     # Phi-3 / 3.5 (fused QKV + gate-up)
 │   │   │   └── examples/                # simple_generate, vanilla_sd_streaming
 │   │   ├── tests/                       # integration tests, all #[ignore]'d
 │   │   │   ├── with_qwen2_05b.rs        # Qwen 2.5 0.5B end-to-end
 │   │   │   ├── with_tinyllama.rs        # TinyLlama 1.1B (Llama 2 arch)
 │   │   │   ├── with_phi3_mini.rs        # Phi-3 mini 4k Instruct
-│   │   │   ├── with_real_medusa_heads.rs        # FasterDecoding head .pt
-│   │   │   └── with_real_medusa_e2e.rs          # Vicuna + Medusa E2E
+│   │   │   ├── with_real_medusa_heads.rs    # FasterDecoding head .pt
+│   │   │   ├── with_real_medusa_e2e.rs      # Vicuna + Medusa E2E
+│   │   │   ├── with_eagle_skeleton.rs       # EAGLE-2 loader smoke test
+│   │   │   ├── with_eagle_e2e.rs            # Llama 3 8B Q4 + EAGLE-2 (honest 0.19×)
+│   │   │   ├── with_eagle_bf16_e2e.rs       # Llama 2 7B BF16 + EAGLE — canonical
+│   │   │   ├── with_eagle3_skeleton.rs      # EAGLE-3 loader + synthetic forward
+│   │   │   ├── with_eagle3_e2e.rs           # Llama 3.1 8B Q4 + EAGLE-3 (honest 0.21×)
+│   │   │   └── tree_logits_consistency.rs   # tree_logits[0] == next_logits invariant
 │   │   └── Cargo.toml
 │   └── speculate-cli/                   # bench binary
 │       └── src/bin/bench.rs
 ├── scripts/                             # release helpers
-│   └── convert_pth_to_safetensors.py    # uvx torch + safetensors converter
 ├── Cargo.toml                           # workspace
 ├── abyo_speculate_plan.md               # original strategy + risk register
 ├── ARCHITECTURE.md                      # this file
 ├── BENCHMARKS.md                        # reproducible measurements
-├── BLOG_DRAFT.md                        # OSS launch post draft
+├── BLOG_DRAFT.md                        # release notes draft
 └── CHANGELOG.md                         # release notes
 ```
 

@@ -442,11 +442,52 @@ impl Llama {
     /// positions (no last-position slice, no LM head). Use the caller's
     /// own LM head to obtain logits.
     pub fn forward(&self, x: &Tensor, index_pos: usize, cache: &mut Cache) -> Result<Tensor> {
+        let (final_h, _) = self.forward_with_layer_hooks(x, index_pos, cache, &[])?;
+        Ok(final_h)
+    }
+
+    /// As [`Self::forward`], but additionally returns the residual stream
+    /// after each requested layer index. Used by EAGLE-3 to fetch
+    /// low/mid/high target features in one forward pass.
+    pub fn forward_with_layer_hooks(
+        &self,
+        x: &Tensor,
+        index_pos: usize,
+        cache: &mut Cache,
+        collect_layers: &[usize],
+    ) -> Result<(Tensor, Vec<Tensor>)> {
         let mut x = self.embed_tokens.forward(x)?;
+        let mut collected: Vec<Option<Tensor>> = vec![None; collect_layers.len()];
         for (i, block) in self.blocks.iter().enumerate() {
             x = block.forward(&x, index_pos, i, cache)?;
+            for (slot, &want) in collect_layers.iter().enumerate() {
+                if want == i {
+                    collected[slot] = Some(x.clone());
+                }
+            }
         }
-        self.norm.forward(&x)
+        let final_h = self.norm.forward(&x)?;
+        let mut out = Vec::with_capacity(collected.len());
+        for (slot, want) in collect_layers.iter().enumerate() {
+            out.push(collected[slot].clone().ok_or_else(|| {
+                candle_core::Error::Msg(format!(
+                    "collect_layers[{slot}] = {want} out of range (n_layers={})",
+                    self.blocks.len()
+                ))
+            })?);
+        }
+        Ok((final_h, out))
+    }
+
+    /// Number of transformer blocks.
+    pub fn num_hidden_layers(&self) -> usize {
+        self.blocks.len()
+    }
+
+    /// Embed token ids via the model's tied embedding (used by EAGLE-3,
+    /// which doesn't ship its own embed_tokens).
+    pub fn embed_tokens(&self, x: &Tensor) -> Result<Tensor> {
+        self.embed_tokens.forward(x)
     }
 
     /// Tree-decoding forward — see [`crate::model::qwen2_local::Model::forward_with_positions`]

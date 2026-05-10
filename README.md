@@ -3,22 +3,21 @@
 Pure Rust [Speculative Decoding](https://arxiv.org/abs/2211.17192) library for
 **local LLMs**, optimized for **batch size 1** single-user inference.
 
-> **Status: alpha (0.1.0)** — APIs may change at any 0.x release. Algorithmic
-> correctness is solid (statistical proofs + real-GPU validation against
-> published checkpoints).
+> **Status: 0.3.0** — APIs may change at any 0.x release. Algorithmic
+> correctness is solid (statistical proofs + greedy-acceptance match
+> against AR baseline on real Llama / Qwen / EAGLE checkpoints).
 
 ## What
 
 abyo-speculate provides multiple Speculative Decoding (SD) algorithms behind
 a unified Rust API:
 
-| Method | Status (v0.1.0) | Measured speedup* |
+| Method | Status (v0.3.0) | Measured speedup* |
 |--------|------------------|-------------------|
-| Vanilla SD (Leviathan 2023) | ✅ shipped | 1.42–1.76× |
+| Vanilla SD (Leviathan 2023) | ✅ shipped | **1.41–1.74×** (see below) |
 | Medusa (Cai 2024) | ✅ shipped (loader + reference loop) | TBD on real heads |
-| EAGLE-2 (Li 2024) | 📋 v0.2.0 | — |
-| EAGLE-3 (Li 2025) | 📋 v0.2.0 | — |
-| SAGUARO (2026) | 📋 v0.3.0 | — |
+| EAGLE-2 (Li 2024) | ✅ shipped (loader + Cartesian + dynamic tree) | depends on target dtype — see EAGLE notes |
+| EAGLE-3 (Li 2025) | ✅ shipped (multi-layer feature fusion + d2t/t2d) | depends on target dtype — see EAGLE notes |
 
 \* Qwen 2.5 3B target + Qwen 2.5 0.5B draft, k = 4, RTX 4070 Ti SUPER, BF16.
 See [`BENCHMARKS.md`](./BENCHMARKS.md).
@@ -29,7 +28,8 @@ See [`BENCHMARKS.md`](./BENCHMARKS.md).
 |--------|--------|-------|
 | Qwen 2 / 2.5 (BF16 / F32) | `model::qwen2_local` + `Qwen2Decoder` | |
 | Qwen 2 / 2.5 (Q4 / Q5 / Q8 GGUF) | `model::quantized_qwen2_local` + `Qwen2QuantDecoder` | Lets 7B fit on 16 GB |
-| Llama 1 / 2 / 3.x | `model::llama_local` + `LlamaDecoder` | |
+| Llama 1 / 2 / 3.x (BF16 safetensors) | `model::llama_local` + `LlamaDecoder` | EAGLE-friendly; tree-attention extensions |
+| Llama 2 / 3 / 3.1 (Q4_K_M GGUF) | `model::quantized_llama_local` + `LlamaQuantDecoder` | Lets 8B fit on 16 GB; bundled HF tokenizer |
 | Mistral | uses Llama path | bench `--family auto` detects |
 | Phi-3 / 3.5 | `model::phi3_local` + `Phi3Decoder` | fused QKV + gate-up |
 
@@ -80,21 +80,38 @@ let engine = SpeculateEngine::preset_for("qwen-2.5-7b")?;
 
 ## Honest benchmarks
 
-Measured on RTX 4070 Ti SUPER (BF16, 128 tokens, k = 4, Qwen 2.5 3B target +
-Qwen 2.5 0.5B draft):
+### Vanilla SD on Qwen 2.5 BF16 (RTX 4070 Ti SUPER, 128 tokens, k = 4)
+
+Qwen 2.5 3B target + Qwen 2.5 0.5B draft (re-measured at v0.3.0):
 
 | Task | AR tok/s | SD tok/s | Speedup |
 |------|---------:|---------:|--------:|
-| chat | 34.0 | 48.5 | **1.42×** |
-| **code** | **33.9** | **59.8** | **1.76×** |
-| translation | 33.8 | 47.2 | **1.40×** |
-| long_context | 31.2 | 48.2 | **1.55×** |
+| chat | 34.4 | 49.5 | **1.44×** |
+| **code** | **35.3** | **61.4** | **1.74×** |
+| translation | 34.1 | 48.0 | **1.41×** |
+| long_context | 31.5 | 49.6 | **1.57×** |
 
-Code generation has the highest speedup — its tokens are the most
-predictable. We do **not** quote a single headline ratio — see
-[`BENCHMARKS.md`](./BENCHMARKS.md) for the full table including model-pair
-sweeps, `draft_lookahead` sweeps, Llama numbers, Medusa loader-compat
-notes, and the cases where SD currently does not help.
+Code generation wins — its tokens are the most predictable.
+
+### EAGLE on Q4 vs BF16 targets — what we learned the hard way
+
+EAGLE drafts are trained on FP16 target hidden states. Feeding them
+**Q4** target hiddens introduces enough quantization noise to lower
+acceptance rate dramatically — measured on Llama 3.1 8B Q4_K_M +
+EAGLE3-LLaMA3.1-Instruct-8B, EAGLE-3 ran at **0.21× of AR** even though
+the implementation is reference-correct (output is byte-for-byte the
+greedy AR trajectory after the v0.2.2 `tree_logits` fix).
+
+**Run EAGLE only against the target dtype it was trained for** (BF16 /
+FP16). The shipped `with_eagle_bf16_e2e` test exercises Llama-2-7B-Chat
+BF16 + `yuhuili/EAGLE-llama2-chat-7B` (~15 GB total — fits a 16 GB GPU);
+that's the canonical configuration for measuring published-paper
+speedups in our crate.
+
+We do **not** quote a single headline ratio — see
+[`BENCHMARKS.md`](./BENCHMARKS.md) for the full table including
+model-pair sweeps, `draft_lookahead` sweeps, Llama numbers, Medusa
+loader-compat notes, and the cases where SD currently does not help.
 
 ## Building
 

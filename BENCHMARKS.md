@@ -28,16 +28,17 @@ cargo run --release --features cuda --bin abyo-speculate-bench -- \
 Models are pulled from Hugging Face on first run and cached at
 `~/.cache/huggingface/hub`. `--family auto` (default) infers from the repo id.
 
-## Per-task: Qwen 2.5 3B + 0.5B draft, k=4
+## Per-task: Qwen 2.5 3B + 0.5B draft, k=4 (vanilla SD, BF16)
 
-128 new tokens, temperature 0.7, top_p 0.95, 1 warmup + 2 runs each.
+128 new tokens, temperature 0.7, top_p 0.95, 1 warmup + 3 runs each.
+Re-measured at v0.3.0 (numbers below are the **mean of 3 runs**).
 
 | Task | AR tok/s | SD tok/s | Speedup |
 |------|---------:|---------:|--------:|
-| chat | 34.0 | 48.5 | **1.42×** |
-| **code** | **33.9** | **59.8** | **1.76×** |
-| translation | 33.8 | 47.2 | **1.40×** |
-| long_context | 31.2 | 48.2 | **1.55×** |
+| chat | 34.4 | 49.5 | **1.44×** |
+| **code** | **35.3** | **61.4** | **1.74×** |
+| translation | 34.1 | 48.0 | **1.41×** |
+| long_context | 31.5 | 49.6 | **1.57×** |
 
 `code` wins by a wide margin — coding tokens are highly predictable
 (whitespace, brackets, common keywords), so the draft model's acceptance
@@ -115,13 +116,53 @@ Two integration tests cover the Medusa story end-to-end:
 Speedup numbers will land in this section once we measure on a 24 GB+
 card. The plumbing is verified; only the headline number is pending.
 
+## EAGLE-2 / EAGLE-3 (v0.3.0)
+
+### EAGLE on Q4 targets — honest negative result
+
+`tests/with_eagle_e2e.rs` and `tests/with_eagle3_e2e.rs` cover Llama 3
+8B Q4_K_M + EAGLE-LLaMA3 / EAGLE3-LLaMA3.1 respectively. After the
+v0.2.2 `tree_logits` fix (single-position GEMV vs multi-position GEMM
+precision drift), both produce **byte-for-byte the AR baseline output**
+under greedy acceptance — i.e. correctness is intact.
+
+| Method (target / draft, depth=4 k=2 dyn=16, 32 tokens) | AR tok/s | SD tok/s | Speedup |
+|--------------------------------------------------------|---------:|---------:|--------:|
+| EAGLE-2 Cartesian, Llama 3 8B Q4_K_M + EAGLE-LLaMA3-8B | 45.0 | 6.6 | **0.15×** |
+| EAGLE-2 Dyn-16,    Llama 3 8B Q4_K_M + EAGLE-LLaMA3-8B | 45.0 | 8.5 | **0.19×** |
+| EAGLE-3 Dyn-16,    Llama 3.1 8B Q4_K_M + EAGLE3-LLaMA3.1-8B | 45.8 | 9.5 | **0.21×** |
+
+The SD numbers are **lower than AR** here. Two compounding effects:
+
+1. **EAGLE drafts are trained on FP16 hidden states.** Feeding Q4
+   target hiddens introduces enough quantization noise that draft
+   predictions drift from target's argmax → low acceptance →
+   per-token cost approaches per-round cost.
+2. **Q4 lm_head dominates per-call cost on this GPU.** A Q4 × 128k
+   vocab QMatMul is ~50 ms; AR runs that exactly once per token.
+   EAGLE-2's draft loop runs it `draft_depth` extra times per round.
+
+We ship these tests so users can reproduce the negative result and
+understand the Q4 trade-off.
+
+### EAGLE on BF16 targets — `tests/with_eagle_bf16_e2e.rs`
+
+The canonical EAGLE configuration: BF16 target (no quantization noise)
++ matching EAGLE-1/-2 checkpoint. We use `NousResearch/Llama-2-7b-chat-hf`
+(13.5 GB safetensors mirror of `meta-llama/Llama-2-7b-chat-hf`, no
+gating) + `yuhuili/EAGLE-llama2-chat-7B`.
+
+Total GPU footprint: ~15 GB → fits a 16 GB card.
+
+The test runs three prompts through both AR and EAGLE-2 (depth=4,
+k=2, dyn=16) and asserts non-empty output. See latest run for the
+measured ratio (the README headline updates with each v0.x release).
+
 ## What's NOT in this table (yet)
 
-- **Real Medusa speedup numbers** — see above.
-- **EAGLE-2 / EAGLE-3.** Not implemented yet.
-- **F16 / Q4 quantisation paths.** Would unlock 7B target on a 16 GB card.
-- **Larger GPUs.** 24 GB+ cards (e.g. RTX 4090, A10G, L4) should land
-  the 7B speedup easily.
+- **Real Medusa speedup numbers** — see above (24 GB+ GPU needed).
+- **EAGLE on a 70B target** — needs an A100 / H100 class card.
+- **Multi-batch serving.** vLLM territory; out of scope.
 
 ## Honesty notes
 

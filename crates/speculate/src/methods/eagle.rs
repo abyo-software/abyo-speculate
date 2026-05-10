@@ -796,7 +796,7 @@ mod tests {
         // Prune to 4 nodes.
         let pruned = prune_cartesian_tree(&cart, &log_probs, 4).expect("prune");
         assert!(pruned.len() <= 4, "pruned should be ≤ 4 nodes");
-        assert!(pruned.len() >= 1);
+        assert!(!pruned.is_empty());
         assert_eq!(pruned.token_at(0), 42, "root preserved");
 
         // The single best path (root, 10, 30) must be present.

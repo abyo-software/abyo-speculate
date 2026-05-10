@@ -233,13 +233,69 @@ impl LlamaDecoder {
             out.push(self.row_to_vec(&row)?);
         }
 
-        // Restore: drop tree, re-feed the root.
+        // Restore: drop tree, re-feed the root. The restoration also gives
+        // us the GEMV-path logits for the root token; we use them to
+        // overwrite per_node_logits[0]. See `LlamaQuantDecoder::tree_logits`
+        // for the full v0.2.2 root-replacement rationale (single-position
+        // forward goes through GEMV, multi-position through GEMM, and the
+        // two have different FP accumulation orders that flip borderline
+        // argmax).
         self.cache.truncate_to(prefix_len).map_err(Error::Candle)?;
         self.cache_len = prefix_len;
-        let _ = self.forward_advance(&[last_committed])?;
+        let restore_logits = self.forward_advance(&[last_committed])?;
+        let restore_row = restore_logits
+            .i((restore_logits.dim(0).map_err(Error::Candle)? - 1, ..))
+            .map_err(Error::Candle)?;
+        out[0] = self.row_to_vec(&restore_row)?;
         debug_assert_eq!(self.cache_len, pre_cache_len);
 
         Ok(out)
+    }
+
+    /// Hidden states of the most recent committed token at multiple layers
+    /// (residual stream after each requested layer's MLP). Used by EAGLE-3
+    /// to fetch low/mid/high target features in one quantized forward.
+    pub fn last_hidden_states_multi(
+        &mut self,
+        layers: &[usize],
+    ) -> Result<(Tensor, Vec<Tensor>)> {
+        if self.history.is_empty() {
+            return Err(Error::Sampling(
+                "last_hidden_states_multi with empty history".into(),
+            ));
+        }
+        let last = *self.history.last().unwrap();
+        let target_len = self.history.len() - 1;
+        self.cache.truncate_to(target_len).map_err(Error::Candle)?;
+        self.cache_len = target_len;
+        let input = Tensor::from_slice(&[last], (1, 1), &self.device).map_err(Error::Candle)?;
+        let (final_h, mids) = self
+            .model
+            .forward_with_layer_hooks(&input, self.cache_len, &mut self.cache, layers)
+            .map_err(Error::Candle)?;
+        self.cache_len += 1;
+        let mids_last: Vec<Tensor> = mids
+            .into_iter()
+            .map(|t| t.i((0, 0, ..)).map_err(Error::Candle))
+            .collect::<Result<_>>()?;
+        let final_last = final_h.i((0, 0, ..)).map_err(Error::Candle)?;
+        Ok((final_last, mids_last))
+    }
+
+    /// Apply the model's lm_head — exposed so EAGLE / EAGLE-3 can re-use
+    /// the target's vocab projection without owning a separate copy.
+    pub fn apply_lm_head(&self, hidden: &Tensor) -> Result<Tensor> {
+        self.lm_head.forward(hidden).map_err(Error::Candle)
+    }
+
+    /// Embed token ids via the target's tied embedding (used by EAGLE-3).
+    pub fn embed_tokens(&self, input_ids: &Tensor) -> Result<Tensor> {
+        self.model.embed_tokens(input_ids).map_err(Error::Candle)
+    }
+
+    /// Number of transformer layers.
+    pub fn num_hidden_layers(&self) -> usize {
+        self.model.num_hidden_layers()
     }
 }
 
@@ -250,6 +306,25 @@ impl crate::model::TreeDecoder for LlamaDecoder {
 
     fn tree_logits(&mut self, tree: &DraftTree) -> Result<Vec<Vec<f32>>> {
         LlamaDecoder::tree_logits(self, tree)
+    }
+
+    fn apply_lm_head(&self, hidden: &Tensor) -> Result<Tensor> {
+        LlamaDecoder::apply_lm_head(self, hidden)
+    }
+
+    fn last_hidden_states_multi(
+        &mut self,
+        layers: &[usize],
+    ) -> Result<(Tensor, Vec<Tensor>)> {
+        LlamaDecoder::last_hidden_states_multi(self, layers)
+    }
+
+    fn num_hidden_layers(&self) -> usize {
+        LlamaDecoder::num_hidden_layers(self)
+    }
+
+    fn embed_tokens(&self, input_ids: &Tensor) -> Result<Tensor> {
+        LlamaDecoder::embed_tokens(self, input_ids)
     }
 }
 

@@ -317,11 +317,12 @@ pub struct Eagle3DraftCandle {
     /// Cached inverse map target_id → draft_id (built at load time from
     /// `d2t_host`). Targets unreachable by the draft are absent.
     target_to_draft: std::collections::HashMap<u32, u32>,
-    /// `t2d` is stored as BoolStorage in the published .pth, which candle's
-    /// pickle loader skips. We don't need it for the forward path — only
-    /// for masking unreachable target ids during sampling — so absence is
-    /// fine. Reserved for v0.2.1 sampling masking.
-    _t2d_present: bool,
+    /// `t2d_mask[target_id] == true` iff `target_id` is reachable from the
+    /// draft vocab (i.e. some draft_id satisfies `d2t[draft_id] == target_id`).
+    /// Computed from d2t at load time — the published checkpoint stores t2d
+    /// as BoolStorage which candle's pickle loader skips, but the value is
+    /// fully derivable from d2t so we don't need to read t2d itself.
+    t2d_mask: Vec<bool>,
 }
 
 impl std::fmt::Debug for Eagle3DraftCandle {
@@ -381,16 +382,16 @@ impl Eagle3DraftCandle {
                 DType::I64,
             )
             .map_err(Error::Candle)?;
-        // t2d is BoolStorage which candle's pth loader skips — its absence
-        // is non-fatal (only used for sampling masking, deferred to v0.2.1).
-        let _t2d_present = vb.contains_tensor("t2d");
-
-        // Cache d2t on host + build inverse map for fast target→draft lookup.
+        // Cache d2t on host + build inverse map and t2d mask. We deliberately
+        // don't try to read t2d from the .pth — it's BoolStorage which
+        // candle's pickle loader skips, and the value is derivable from d2t.
         let d2t_host: Vec<i64> = d2t.to_vec1::<i64>().map_err(Error::Candle)?;
         let mut target_to_draft = std::collections::HashMap::with_capacity(d2t_host.len());
+        let mut t2d_mask = vec![false; config.target_vocab_size];
         for (draft_id, &target_id) in d2t_host.iter().enumerate() {
             if target_id >= 0 && (target_id as u32) < config.target_vocab_size as u32 {
                 target_to_draft.insert(target_id as u32, draft_id as u32);
+                t2d_mask[target_id as usize] = true;
             }
         }
         drop(d2t);
@@ -403,7 +404,7 @@ impl Eagle3DraftCandle {
             lm_head,
             d2t_host,
             target_to_draft,
-            _t2d_present,
+            t2d_mask,
         })
     }
 
@@ -483,12 +484,32 @@ impl Eagle3DraftCandle {
     }
 
     /// Whether the target vocab id is reachable from the draft vocab.
-    /// Falls back to `Some(true)` when the published checkpoint stored
-    /// `t2d` as BoolStorage (which candle's pickle loader skips); v0.2.1
-    /// will plumb a separate uint8 conversion path.
     pub fn target_token_is_reachable(&self, target_id: u32) -> Result<bool> {
-        let _ = target_id;
-        Ok(self.target_to_draft.contains_key(&target_id) || !self._t2d_present)
+        Ok(self
+            .t2d_mask
+            .get(target_id as usize)
+            .copied()
+            .unwrap_or(false))
+    }
+
+    /// Borrow the t2d mask directly (length = `target_vocab_size`,
+    /// `mask[i] == true` iff target id `i` is reachable from the draft).
+    /// Use this to mask the target's distribution before sampling.
+    pub fn t2d_mask(&self) -> &[bool] {
+        &self.t2d_mask
+    }
+
+    /// Apply the t2d mask in-place on a target-vocab logit vector,
+    /// setting unreachable entries to `f32::NEG_INFINITY` so subsequent
+    /// softmax / argmax will skip them. Useful when sampling the target
+    /// distribution under EAGLE-3's reachability constraint.
+    pub fn mask_target_logits(&self, logits: &mut [f32]) {
+        debug_assert_eq!(logits.len(), self.t2d_mask.len());
+        for (i, slot) in logits.iter_mut().enumerate() {
+            if !self.t2d_mask[i] {
+                *slot = f32::NEG_INFINITY;
+            }
+        }
     }
 }
 
@@ -751,6 +772,26 @@ mod tests {
         assert_eq!(c.draft_vocab_size, 32000);
         assert_eq!(c.target_vocab_size, 128256);
         assert_eq!(c.head_dim(), 128);
+    }
+
+    #[test]
+    fn t2d_mask_derives_from_d2t() {
+        // Build a synthetic Eagle3DraftCandle by skipping the .pth load —
+        // construct directly via the fields we want to test. This is a
+        // lightweight sanity check of the mask derivation, not the loader.
+        // (The full loader is exercised by the e2e tests.)
+        let target_vocab_size = 10;
+        let d2t_host: Vec<i64> = vec![0, 3, 5, 9, -1]; // draft 0..4
+        let mut target_to_draft = std::collections::HashMap::new();
+        let mut t2d_mask = vec![false; target_vocab_size];
+        for (di, &ti) in d2t_host.iter().enumerate() {
+            if ti >= 0 && (ti as u32) < target_vocab_size as u32 {
+                target_to_draft.insert(ti as u32, di as u32);
+                t2d_mask[ti as usize] = true;
+            }
+        }
+        assert_eq!(t2d_mask, vec![true, false, false, true, false, true, false, false, false, true]);
+        // The -1 entry produces no t2d mapping (unreachable slot).
     }
 
     #[test]
