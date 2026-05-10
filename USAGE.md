@@ -224,6 +224,13 @@ a **Q4** target works (output is correct via greedy acceptance) but
 acceptance rate falls and you typically end up *slower* than AR — the
 quantization noise pushes draft predictions away from target's argmax.
 
+A complete worked example ships at
+`crates/speculate/examples/eagle2_bf16.rs`:
+
+```sh
+cargo run --release --features cuda --example eagle2_bf16
+```
+
 ## Scenario 8: EAGLE-3 (multi-layer feature fusion)
 
 ```rust

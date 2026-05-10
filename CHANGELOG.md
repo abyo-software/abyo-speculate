@@ -9,6 +9,24 @@ While the project is at `0.x`, breaking changes can land in any minor or
 patch release; we'll only commit to `1.x`-style stability after the API
 shape has been used in anger by at least one external project.
 
+## [0.3.2] — 2026-05-10
+
+### EAGLE-2 worked example
+
+`crates/speculate/examples/eagle2_bf16.rs` — downloads
+`NousResearch/Llama-2-7b-chat-hf` BF16 + `yuhuili/EAGLE-llama2-chat-7B`,
+runs greedy generation with EOS detection, prints the result. Use as a
+template for production EAGLE setups.
+
+```sh
+cargo run --release --features cuda --example eagle2_bf16
+```
+
+Caveats baked into the example's docstring: ~15 GB GPU footprint;
+EAGLE-2 measures ~0.5× of plain AR on Llama 2 7B BF16 on consumer
+16 GB GPUs (architecture is MHA so per-step AR is already cheap).
+Documented limitation, not a regression.
+
 ## [0.3.1] — 2026-05-10
 
 ### EOS support in `run_eagle` and `run_eagle3`
