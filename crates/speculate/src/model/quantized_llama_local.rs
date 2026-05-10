@@ -311,6 +311,13 @@ impl ModelWeights {
         self.layers.len()
     }
 
+    /// Embed a single token id (or batch). Used by EAGLE-3's draft loop
+    /// where the draft has no embed_tokens of its own and must reuse the
+    /// target's tied embedding.
+    pub fn embed_tokens(&self, input_ids: &Tensor) -> Result<Tensor> {
+        self.tok_embeddings.forward(input_ids)
+    }
+
     fn causal_bias(&mut self, prev_len: usize, seq_len: usize) -> Result<Tensor> {
         let total = prev_len + seq_len;
         let key = (prev_len << 20) | seq_len;

@@ -209,6 +209,12 @@ impl LlamaQuantDecoder {
         self.model.num_hidden_layers()
     }
 
+    /// Embed token ids via the target's tied embedding. EAGLE-3 reuses
+    /// this — the draft checkpoint ships without embed_tokens.
+    pub fn embed_tokens(&self, input_ids: &Tensor) -> Result<Tensor> {
+        self.model.embed_tokens(input_ids).map_err(Error::Candle)
+    }
+
     pub fn tree_logits(&mut self, tree: &DraftTree) -> Result<Vec<Vec<f32>>> {
         if self.history.is_empty() {
             return Err(Error::Sampling("tree_logits with empty history".into()));
@@ -285,6 +291,10 @@ impl TreeDecoder for LlamaQuantDecoder {
 
     fn num_hidden_layers(&self) -> usize {
         LlamaQuantDecoder::num_hidden_layers(self)
+    }
+
+    fn embed_tokens(&self, input_ids: &Tensor) -> Result<Tensor> {
+        LlamaQuantDecoder::embed_tokens(self, input_ids)
     }
 }
 

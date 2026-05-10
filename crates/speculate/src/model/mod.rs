@@ -157,4 +157,16 @@ pub trait TreeDecoder: Decoder {
     fn num_hidden_layers(&self) -> usize {
         0
     }
+
+    /// Embed token ids via this decoder's tied embedding. EAGLE-3 needs
+    /// this because the draft checkpoint does not ship its own
+    /// embed_tokens — the official inference flow reuses the target's.
+    /// Default impl returns `UnsupportedMethod`.
+    fn embed_tokens(&self, input_ids: &candle_core::Tensor) -> Result<candle_core::Tensor> {
+        let _ = input_ids;
+        Err(crate::Error::UnsupportedMethod {
+            method: "embed_tokens",
+            reason: "this TreeDecoder does not expose its embedding table".into(),
+        })
+    }
 }

@@ -92,6 +92,27 @@ fn llama31_8b_q4_with_eagle_3_speedup() {
     let prompt_ids = target.encode(prompt_text, true).unwrap();
     eprintln!("prompt: {} tokens", prompt_ids.len());
 
+    // Direct probe.
+    {
+        use abyo_speculate::model::TreeDecoder;
+        use abyo_speculate::tree::DraftTree;
+        Decoder::observe(&mut target, &prompt_ids).unwrap();
+        let nl = Decoder::next_logits(&mut target).unwrap();
+        let nl_argmax = nl.iter().enumerate().fold((0usize, f32::NEG_INFINITY), |(bi, bv), (i, &v)| if v > bv {(i,v)} else {(bi,bv)}).0;
+        let root = *target.history().last().unwrap();
+        let t1 = DraftTree::from_parent_table(&[(0, root)]).unwrap();
+        let l1 = TreeDecoder::tree_logits(&mut target, &t1).unwrap();
+        let l1_arg = l1[0].iter().enumerate().fold((0usize, f32::NEG_INFINITY), |(bi, bv), (i, &v)| if v > bv {(i,v)} else {(bi,bv)}).0;
+        let cart = abyo_speculate::methods::medusa::MedusaHeads::from_config(
+            abyo_speculate::methods::medusa::MedusaConfig{n_heads:4,hidden_size:4096,vocab_size:128256,residual_layers:1})
+            .build_draft_tree(root, &[vec![100,200],vec![300,400],vec![500,600],vec![700,800]],
+                abyo_speculate::methods::medusa::TreeTopology::CartesianProduct).unwrap();
+        let l_cart = TreeDecoder::tree_logits(&mut target, &cart).unwrap();
+        let l_cart_arg = l_cart[0].iter().enumerate().fold((0usize, f32::NEG_INFINITY), |(bi, bv), (i, &v)| if v > bv {(i,v)} else {(bi,bv)}).0;
+        eprintln!("[probe] root={} | next_logits={} | tree(1)={} | tree({})={}", root, nl_argmax, l1_arg, cart.len(), l_cart_arg);
+        target.reset();
+    }
+
     // 5. AR baseline.
     eprintln!("\n=== autoregressive baseline ===");
     Decoder::observe(&mut target, &prompt_ids).unwrap();

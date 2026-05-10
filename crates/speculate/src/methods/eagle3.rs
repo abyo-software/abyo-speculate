@@ -22,26 +22,46 @@
 //!    not `hidden` — the draft's attention sees the concat of the
 //!    fc-projected feature plus the latest target hidden state.
 //!
-//! ## Status: scaffolding + loader for v0.2.0
+//! ## Status: reference-matching architecture + outstanding tree_logits bug
 //!
-//! What's wired:
+//! What's wired (v0.2.1):
 //! - [`Eagle3DraftConfig`] from `yuhuili/EAGLE3-LLaMA3.1-Instruct-8B`'s
 //!   defaults.
 //! - [`Eagle3DraftCandle::from_pth`] / `from_var_builder` parse every
-//!   key in the checkpoint (15 tensors verified by inspection).
-//! - Forward pass through the midlayer with the full concat input.
+//!   key in the checkpoint (no `embed_tokens`; the published checkpoint
+//!   reuses the **target's** tied embedding via [`Self::forward`]'s
+//!   `input_emb` arg).
+//! - [`Self::forward_hidden`] matches `Model.forward` from
+//!   `SafeAILab/EAGLE/eagle/model/cnets.py`: applies `fc` only when
+//!   the input is the 3*hidden concat (first round); subsequent rounds
+//!   pass the previous draft's pre-norm midlayer output back in.
+//! - [`Self::apply_norm_lm_head`] mirrors
+//!   `lm_head(self.norm(last_hidden))`.
+//! - [`Eagle3RunConfig::default_layers_for`] returns the published
+//!   training recipe's layer triple — `2 / n/2 / n-3` (input-of), which
+//!   in our after-layer-i convention is `[1, n/2 - 1, n - 4]`.
+//! - [`run_eagle3`] runs the official schedule: round-0 uses
+//!   `embed(root_token) + concat(low,mid,high)`; subsequent rounds pass
+//!   `embed(top1_drafted) + previous midlayer output`.
 //!
-//! What still needs target-side cooperation (deferred to v0.2.1):
-//! - `TreeDecoder::last_hidden_states_multi(layers: &[usize])` — returns
-//!   the requested layers' hidden states for the most recent token.
-//!   Currently `last_hidden_state` only exposes the final layer's output.
-//!   EAGLE-3 needs three layers; the target extension lands when the
-//!   model-side bookkeeping is plumbed through.
-//! - Dynamic tree construction guided by EAGLE-3's draft confidence (same
-//!   v0.2.1 batch as EAGLE-2 dynamic).
+//! ## Known v0.2.1 blocker (deferred to v0.2.2)
 //!
-//! Loader + forward are unit-testable today via [`Eagle3DraftCandle::forward`]
-//! against synthetic inputs.
+//! `LlamaQuantDecoder::tree_logits` returns a different root distribution
+//! than `next_logits` would for the same state when the tree has more
+//! than one node. Reproduction:
+//!
+//! ```text
+//! root=374        (the " is" token at the prompt's end)
+//! next_logits     argmax = 264   (" a")
+//! tree_logits(1)  argmax = 264   ✓
+//! tree_logits(31) argmax = 12366 (" Paris")  ✗
+//! ```
+//!
+//! The bug breaks greedy acceptance correctness — a fix in
+//! `quantized_llama_local::ModelWeights::forward_with_positions` (or in
+//! the attention-bias broadcast in `LayerWeights::run_attn`) is the
+//! v0.2.2 critical-path work. The regression test
+//! `tests/tree_logits_consistency.rs` captures the invariant.
 
 #![allow(missing_docs)]
 
@@ -407,41 +427,58 @@ impl Eagle3DraftCandle {
         self.midlayer.clear_kv_cache();
     }
 
-    /// One forward step.
+    /// Run the midlayer once, returning the **pre-norm** midlayer output.
+    /// This output is what gets fed back into the *next* draft step (the
+    /// official inference loop reuses `last_hidden` from one round as the
+    /// `hidden_states` arg of the next).
     ///
-    /// Inputs:
-    /// - `low / mid / high`: each `[1, seq, hidden]` — three target hidden
-    ///   states selected by the EAGLE-3 training recipe (we default to
-    ///   layers `[1, n/2, n-2]` for `Eagle3RunConfig::default_layers_for`).
-    /// - `last_target_hidden`: `[1, seq, hidden]` — the most recent target
-    ///   hidden state, fed into the midlayer's attention input alongside
-    ///   the projected feature concat.
-    /// - `token_ids`: `[1, seq]` — informational only. The published
-    ///   EAGLE-3 LLaMA3.1 checkpoint has no `embed_tokens`; the draft
-    ///   autoregresses purely on hidden states. Kept as a parameter for
-    ///   forward-compat with embed-bearing variants.
-    /// - `position`: absolute position offset for RoPE.
-    ///
-    /// Returns `[1, seq, draft_vocab]` — logits over the draft vocab. Use
-    /// [`Self::draft_to_target_token`] to map back to target ids before
-    /// committing.
+    /// Args (matching `Model.forward` in `eagle/model/cnets.py`):
+    /// - `hidden_states`: `[b, seq, target_hidden_size * 3]` for the first
+    ///   round (concat of low/mid/high), or `[b, seq, hidden_size]` for
+    ///   subsequent rounds (previous draft's midlayer output). The fc
+    ///   projection is applied iff the inner dim is the 3*hidden form.
+    /// - `input_emb`: `[b, seq, hidden_size]` — embed_tokens(token_ids)
+    ///   from the **target's** tied embedding table.
+    /// - `position`: RoPE position offset.
+    pub fn forward_hidden(
+        &mut self,
+        hidden_states: &Tensor,
+        input_emb: &Tensor,
+        position: usize,
+    ) -> Result<Tensor> {
+        let inner = hidden_states.dims()[hidden_states.rank() - 1];
+        let projected = if inner == self.config.hidden_size {
+            hidden_states.clone()
+        } else {
+            self.fc.forward(hidden_states).map_err(Error::Candle)?
+        };
+        self.midlayer.forward(input_emb, &projected, position)
+    }
+
+    /// Apply the draft's `norm + lm_head` on a midlayer output. Mirrors
+    /// the official `last_headout = self.lm_head(self.norm(last_hidden))`.
+    /// Returns `[b, seq, draft_vocab]` logits over the draft vocab.
+    pub fn apply_norm_lm_head(&self, hidden: &Tensor) -> Result<Tensor> {
+        let h = self.norm.forward(hidden).map_err(Error::Candle)?;
+        self.lm_head.forward(&h).map_err(Error::Candle)
+    }
+
+    /// Convenience wrapper: midlayer + norm + lm_head in one call. Use
+    /// when you only need the logits and don't intend to feed the
+    /// midlayer output into a subsequent step.
     pub fn forward(
         &mut self,
         low: &Tensor,
         mid: &Tensor,
         high: &Tensor,
-        last_target_hidden: &Tensor,
+        input_emb: &Tensor,
         token_ids: &Tensor,
         position: usize,
     ) -> Result<Tensor> {
-        let _ = token_ids; // intentionally unused — see doc comment.
+        let _ = token_ids; // input_emb already encodes token info.
         let combined = Tensor::cat(&[low, mid, high], D::Minus1).map_err(Error::Candle)?;
-        let projected = self.fc.forward(&combined).map_err(Error::Candle)?;
-        let h = self
-            .midlayer
-            .forward(last_target_hidden, &projected, position)?;
-        let h = self.norm.forward(&h).map_err(Error::Candle)?;
-        self.lm_head.forward(&h).map_err(Error::Candle)
+        let h = self.forward_hidden(&combined, input_emb, position)?;
+        self.apply_norm_lm_head(&h)
     }
 
     /// Map a draft-vocab id to the target's vocabulary. Uses the cached
@@ -480,13 +517,19 @@ pub struct Eagle3RunConfig {
 }
 
 impl Eagle3RunConfig {
-    /// Compute the default `[1, n/2, n - 2]` layer triple for a target with
-    /// `n_layers` transformer blocks.
+    /// Compute the default layer triple matching the published EAGLE-3
+    /// LLaMA training recipe (`SafeAILab/EAGLE/eagle/traineagle3/modeling_llama_kv.py`
+    /// line 1139): hidden states captured at the **input** of layers
+    /// `2`, `n/2`, `n-3`. In our 0-based "after-layer-i" convention
+    /// (where `mids[i]` is the residual *after* layer `i`'s MLP), that
+    /// is `[1, n/2 - 1, n - 4]`.
+    ///
+    /// For 32-layer Llama 3.1 8B → `[1, 15, 28]`.
     pub fn default_layers_for(n_layers: usize) -> [usize; 3] {
         if n_layers < 4 {
             [0, 0, 0]
         } else {
-            [1, n_layers / 2, n_layers.saturating_sub(2)]
+            [1, n_layers / 2 - 1, n_layers.saturating_sub(4)]
         }
     }
 }
@@ -497,7 +540,7 @@ impl Default for Eagle3RunConfig {
             top_k_per_step: 2,
             draft_depth: 4,
             max_tree_nodes: None,
-            layer_indices: [1, 16, 30], // Llama 3.1 8B default
+            layer_indices: [1, 15, 28], // Llama 3.1 8B published recipe
             temperature: 0.0,
             top_p: 1.0,
         }
@@ -550,6 +593,7 @@ where
         // Reshape each to [1, 1, hidden] and promote to the draft's dtype
         // (target hiddens come back F32 from the Q4 path; the draft is F16).
         let draft_dtype = draft.fc.weight().dtype();
+        let device = final_h.device().clone();
         let to_3d = |t: &candle_core::Tensor| -> Result<candle_core::Tensor> {
             let t = if t.dtype() != draft_dtype {
                 t.to_dtype(draft_dtype).map_err(Error::Candle)?
@@ -564,26 +608,33 @@ where
         let low = to_3d(&mids[0])?;
         let mid = to_3d(&mids[1])?;
         let high = to_3d(&mids[2])?;
-        let last_h = to_3d(&final_h)?;
+        // First-round hidden_states: [1, 1, 3*hidden] concat — fc applied inside forward_hidden.
+        let mut hidden_in =
+            Tensor::cat(&[&low, &mid, &high], D::Minus1).map_err(Error::Candle)?;
 
         draft.reset();
         let history_len = target.history_len();
 
-        // 2. Run the draft `draft_depth` times. Top-k taken from the
-        //    draft's own (32k) lm_head — no Q4 128k call.
+        // 2. Run the draft `draft_depth` times. Each step:
+        //    - input_emb = target.embed(current_token_id)
+        //    - hidden_in = previous midlayer output (or first-round 3*hidden concat)
+        //    - midlayer → out_hidden → norm + lm_head → top-k (in draft vocab)
         let mut per_step_top_k_target: Vec<Vec<u32>> = Vec::with_capacity(config.draft_depth);
         let mut per_step_top_k_log_probs: Vec<Vec<f32>> = Vec::with_capacity(config.draft_depth);
-        let mut current_token_ids = Tensor::from_slice(&[root_draft_id], (1, 1), &low.device())
-            .map_err(Error::Candle)?;
+        // First step uses the committed root token for the embed lookup.
+        let mut current_target_id = root_token;
         for step in 0..config.draft_depth {
-            let logits = draft.forward(
-                &low,
-                &mid,
-                &high,
-                &last_h,
-                &current_token_ids,
-                history_len + step,
-            )?;
+            // input_emb = target.embed_tokens(current_target_id) → [1, 1, hidden] in draft dtype.
+            let token_ids = Tensor::from_slice(&[current_target_id], (1, 1), &device)
+                .map_err(Error::Candle)?;
+            let input_emb = target.embed_tokens(&token_ids)?;
+            let input_emb = if input_emb.dtype() != draft_dtype {
+                input_emb.to_dtype(draft_dtype).map_err(Error::Candle)?
+            } else {
+                input_emb
+            };
+            let out_hidden = draft.forward_hidden(&hidden_in, &input_emb, history_len + step)?;
+            let logits = draft.apply_norm_lm_head(&out_hidden)?;
             let last = logits
                 .i((0, logits.dim(1).map_err(Error::Candle)? - 1, ..))
                 .map_err(Error::Candle)?
@@ -596,18 +647,17 @@ where
             let lse = last.iter().map(|&v| (v - max_l).exp()).sum::<f32>().ln() + max_l;
             let log_probs: Vec<f32> = top_idx.iter().map(|&i| last[i] - lse).collect();
             per_step_top_k_log_probs.push(log_probs);
-            // Translate draft ids → target ids for the tree (target's
-            // tree_logits expects target-vocab tokens).
             let mut top_target = Vec::with_capacity(top_idx.len());
             for &di in &top_idx {
                 top_target.push(draft.draft_to_target_token(di as u32)?);
             }
-            per_step_top_k_target.push(top_target);
+            per_step_top_k_target.push(top_target.clone());
 
-            // For draft autoregression next step, advance with top-1 in DRAFT vocab.
-            let next_draft_id = top_idx[0] as u32;
-            current_token_ids =
-                Tensor::from_slice(&[next_draft_id], (1, 1), &low.device()).map_err(Error::Candle)?;
+            // For the NEXT iteration: hidden_in = this step's midlayer output;
+            // current_target_id = top-1 candidate (already in target vocab).
+            hidden_in = out_hidden;
+            current_target_id = top_target[0];
+            let _ = root_draft_id; // silence — driven via target ids now.
         }
 
         // 3. Build Cartesian-product tree in TARGET vocab, optionally pruned.
@@ -716,7 +766,9 @@ mod tests {
 
     #[test]
     fn default_layer_indices_for_8b() {
+        // Published EAGLE-3 LLaMA recipe: layers `2, n/2, n-3` (input-of)
+        // → in our after-layer-i convention `[1, n/2 - 1, n - 4]`.
         let l = Eagle3RunConfig::default_layers_for(32);
-        assert_eq!(l, [1, 16, 30]);
+        assert_eq!(l, [1, 15, 28]);
     }
 }
