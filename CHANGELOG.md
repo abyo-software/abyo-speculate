@@ -9,6 +9,61 @@ While the project is at `0.x`, breaking changes can land in any minor or
 patch release; we'll only commit to `1.x`-style stability after the API
 shape has been used in anger by at least one external project.
 
+## [0.2.1] — 2026-05-10
+
+### EAGLE-3 reference-matching architecture
+
+Refactors `Eagle3DraftCandle` and `run_eagle3` to mirror the published
+inference flow (`SafeAILab/EAGLE/eagle/model/cnets.py`):
+
+- The published EAGLE-3 checkpoint has **no `embed_tokens`** — the draft
+  reuses the **target's** tied embedding via the new
+  `TreeDecoder::embed_tokens` trait method (impl on `LlamaQuantDecoder`
+  → `ModelWeights::embed_tokens`).
+- New `Eagle3DraftCandle::forward_hidden` returns the pre-norm midlayer
+  output (fc applied iff input is the 3*hidden concat). New
+  `apply_norm_lm_head` mirrors `lm_head(self.norm(last_hidden))`.
+- `run_eagle3` now follows the official schedule:
+  - Round 0: `embed(root_token) + concat(low,mid,high)`
+  - Round i+1: `embed(top1_drafted) + previous midlayer output`
+- `Eagle3RunConfig::default_layers_for(n)` now returns the published
+  training recipe — `2 / n/2 / n-3` (input-of), which in our
+  after-layer-i convention is `[1, n/2 - 1, n - 4]` =
+  **`[1, 15, 28]`** for Llama 3.1 8B (was `[1, 16, 30]`).
+- New `last_hidden_states_multi(layers)` on `TreeDecoder` /
+  `LlamaQuantDecoder` to fetch the low/mid/high target features in
+  one quantized forward.
+- New `forward_hidden_with_layers` on `quantized_llama_local::ModelWeights`.
+
+### Known blocker (v0.2.2 critical path)
+
+`LlamaQuantDecoder::tree_logits` returns a different root distribution
+than `next_logits` would for the same state when the tree has > 1 node.
+Repro on Llama 3.1 8B Q4_K_M, prompt "The capital of France is":
+
+```text
+root_token       = 374    (" is")
+next_logits  arg = 264    (" a")
+tree_logits(1)   = 264    ✓
+tree_logits(31)  = 12366  (" Paris")  ✗
+```
+
+Captured by `tests/tree_logits_consistency.rs` (gated under `#[ignore]`).
+The bug is in `forward_with_positions` / the attention-bias broadcast in
+`run_attn` and breaks greedy acceptance correctness whenever the
+draft's top-1 disagrees with target argmax. EAGLE-2 + Llama 3.0 happens
+to dodge this because the prompt's argmax is stable for both code paths.
+
+Until v0.2.2 lands the fix:
+- EAGLE-3 e2e on Llama 3.1 still posts **0.21×** (output is coherent
+  but diverges from greedy AR for the same reason).
+- EAGLE-2 e2e on Llama 3.0 keeps producing AR-matching output.
+
+### Other
+
+- 73 unit tests pass; 1 new `#[ignore]` regression test for the
+  tree_logits invariant.
+
 ## [0.2.0] — 2026-05-10
 
 ### Methods
