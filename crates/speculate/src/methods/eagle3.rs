@@ -29,13 +29,13 @@
 //!   defaults.
 //! - [`Eagle3DraftCandle::from_pth`] / `from_var_builder` parse every
 //!   key in the checkpoint (no `embed_tokens`; the published checkpoint
-//!   reuses the **target's** tied embedding via [`Self::forward`]'s
+//!   reuses the **target's** tied embedding via [`Eagle3DraftCandle::forward`]'s
 //!   `input_emb` arg).
-//! - [`Self::forward_hidden`] matches `Model.forward` from
+//! - [`Eagle3DraftCandle::forward_hidden`] matches `Model.forward` from
 //!   `SafeAILab/EAGLE/eagle/model/cnets.py`: applies `fc` only when
 //!   the input is the 3*hidden concat (first round); subsequent rounds
 //!   pass the previous draft's pre-norm midlayer output back in.
-//! - [`Self::apply_norm_lm_head`] mirrors
+//! - [`Eagle3DraftCandle::apply_norm_lm_head`] mirrors
 //!   `lm_head(self.norm(last_hidden))`.
 //! - [`Eagle3RunConfig::default_layers_for`] returns the published
 //!   training recipe's layer triple — `2 / n/2 / n-3` (input-of), which

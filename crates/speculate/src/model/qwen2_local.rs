@@ -30,11 +30,11 @@
 //!
 //! ## What's new
 //!
-//! - [`RotaryEmbedding::apply_rotary_emb_qkv_at_positions`] — `&[u32]` of
+//! - `RotaryEmbedding::apply_rotary_emb_qkv_at_positions` — `&[u32]` of
 //!   absolute positions, `index_select`'d into the precomputed cos/sin tables.
-//! - [`Attention::forward_with_positions`] — uses the per-position RoPE +
+//! - `Attention::forward_with_positions` — uses the per-position RoPE +
 //!   accepts a fully-formed 4D attention bias.
-//! - [`DecoderLayer::forward_with_positions`].
+//! - `DecoderLayer::forward_with_positions`.
 //! - [`Model::forward_with_positions`] — the tree-decoding entry point.
 //! - [`Model::truncate_kv_cache_to`] — partial KV cache truncation, replaces
 //!   the slow clear+replay rollback in `Qwen2Decoder` (Phase 1c).

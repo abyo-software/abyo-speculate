@@ -9,6 +9,50 @@ While the project is at `0.x`, breaking changes can land in any minor or
 patch release; we'll only commit to `1.x`-style stability after the API
 shape has been used in anger by at least one external project.
 
+## [0.4.2] — 2026-05-10
+
+### EAGLE strict-mode toggle
+
+`EagleRunConfig::strict_root_gemv` (and `Eagle3RunConfig` analog) —
+default off, opt-in to restore the v0.2.2 GEMV root-fix invariant
+(`tree_logits[0] argmax == next_logits argmax`) so the EAGLE trajectory
+matches AR exactly under greedy acceptance. Costs **zero extra
+forwards** — captures the cached `last_logits` from the prior `observe`
+before the tree forward invalidates it. Trade-off is fewer accepted
+draft tokens per round, so SD throughput drops in exchange for
+trajectory correctness.
+
+Measured on Llama 2 7B BF16 + EAGLE-llama2-chat-7B (depth=2 k=2):
+
+  fast (default): AR 43.7 tok/s | EAGLE 20.2 tok/s | 0.46×  (may diverge)
+  strict:         AR 43.9 tok/s | EAGLE 13.7 tok/s | 0.31×  (matches AR)
+
+### Other
+
+- **Negative-result trail kept**: tried extending the v0.4.1
+  `next_logits` cached-logits trick to `batched_logits` (vanilla SD).
+  Lowered SD acceptance 25-35% because the GEMV-cached `last` KV
+  doesn't match the GEMM-batched re-compute the drafts attend
+  against. Reverted with explanatory comments in all 5
+  `batched_logits` impls.
+- **Cross-dtype Q4 7B + BF16 0.5B test** (`tests/with_qwen2_q4_cross_dtype.rs`):
+  measures 99.5 tok/s AR on Qwen 2.5 7B Q4_K_M (faster than BF16 3B at
+  67 tok/s — Q4 weights are 4× smaller, memory-bandwidth-bound). Vocab
+  mismatch (152064 vs 151936) blocks vanilla SD on this combo; clean
+  Q4-aligned target/draft pair is a v0.5 follow-up.
+- **`SpeculateEngine` error message refresh**: the "method not yet
+  implemented in Phase 1" placeholder for Medusa / EAGLE now points at
+  the direct `methods::medusa::run_medusa_real` / `methods::eagle::run_eagle`
+  / `methods::eagle3::run_eagle3` entry points.
+- **Doc warnings fixed** (`-D warnings`): module-level docs no longer
+  link to private items or use ambiguous `[]` syntax. CI doc job no
+  longer uses `--all-features` (the Mac-only `accelerate` feature can't
+  build on Ubuntu).
+- **`Default` blanket** for `EagleRunConfig` / `Eagle3RunConfig`
+  callers — adding fields no longer breaks downstream struct literals.
+- **`BLOG_DRAFT.md` rewritten** as the v0.4.x honest-pivot story.
+- 76 unit tests pass (was 74; +2 for `EagleRunConfig` toggle coverage).
+
 ## [0.4.1] — 2026-05-10
 
 ### `next_logits` cache: AR 2× faster (across all decoders)

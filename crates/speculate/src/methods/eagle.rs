@@ -743,7 +743,7 @@ where
     Ok(generated)
 }
 
-/// Pub-facing alias of [`prune_cartesian_tree`] for the EAGLE-3 module.
+/// Pub-facing alias of `prune_cartesian_tree` for the EAGLE-3 module.
 pub fn prune_cartesian_tree_pub(
     full: &crate::tree::DraftTree,
     per_step_log_probs: &[Vec<f32>],

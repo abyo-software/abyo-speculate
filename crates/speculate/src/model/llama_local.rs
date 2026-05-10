@@ -15,7 +15,7 @@
 //!
 //! What we add:
 //! - [`Cache::truncate_to`] — partial KV cache truncation per layer.
-//! - [`CausalSelfAttention::forward_with_positions`] — per-token absolute
+//! - `CausalSelfAttention::forward_with_positions` — per-token absolute
 //!   positions for the tree-decoding RoPE.
 //! - [`Llama::forward_with_positions`] — tree-decoding forward with a
 //!   pre-built 4D attention bias.

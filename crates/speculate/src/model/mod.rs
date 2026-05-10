@@ -204,7 +204,7 @@ pub trait TreeDecoder: Decoder {
     /// reordering only. The `accepted_indices` are tree node indices in
     /// BFS order from the root (e.g. `[0, 1, 4]`). Index 0 (root) is
     /// always present. To add a bonus token after, follow up with a
-    /// normal [`Self::observe`] call.
+    /// normal [`Decoder::observe`] call.
     fn commit_tree_path(
         &mut self,
         tree: &crate::tree::DraftTree,

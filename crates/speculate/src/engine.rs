@@ -1,15 +1,19 @@
 //! [`SpeculateEngine`] — the public façade that ties model loading, the chosen
 //! SD method, and sampling together.
 //!
-//! Phase 1 ships:
-//! - The builder + dispatch skeleton (this file)
-//! - A working `Method::Autoregressive` path that does real generation with a
-//!   loaded [`Decoder`]
-//! - A `Method::Vanilla` path that runs the
-//!   [reference SD loop](crate::methods::vanilla::run_vanilla_sd) against a
-//!   loaded target + draft pair
+//! v0.4.x dispatch covers:
+//! - `Method::Autoregressive` — real generation against any loaded
+//!   [`Decoder`].
+//! - `Method::Vanilla` — Leviathan SD with the modified rejection rule.
 //!
-//! Medusa / EAGLE land in Phase 1b / 2.
+//! `Method::Medusa` / `Method::Eagle2` / `Method::Eagle3` are
+//! implemented in [`crate::methods::medusa`] / [`crate::methods::eagle`]
+//! / [`crate::methods::eagle3`] and accessible via the direct `run_*`
+//! entry points in those modules. They aren't yet plumbed through
+//! `SpeculateEngine` because the EAGLE / Medusa drafts have a richer
+//! shape than the `Decoder` trait (multi-head heads, `EagleDraftCandle`
+//! structs, etc.); generic engine dispatch is v0.5.0 scope. See
+//! `USAGE.md` Scenarios 6-8 for the direct API.
 
 use crate::{
     methods::Method,
@@ -216,7 +220,18 @@ impl SpeculateEngine {
             }
             other => Err(Error::UnsupportedMethod {
                 method: other.name(),
-                reason: "method not yet implemented in Phase 1".into(),
+                reason: format!(
+                    "{} is implemented in `crate::methods::{}` (call run_eagle / run_eagle3 / \
+                     run_medusa_real directly with the appropriate draft / heads). \
+                     Engine-level dispatch is v0.5.0 scope — see CHANGELOG.",
+                    other.name(),
+                    match other {
+                        Method::Medusa => "medusa",
+                        Method::Eagle2 => "eagle",
+                        Method::Eagle3 => "eagle3",
+                        _ => "<unreachable>",
+                    },
+                ),
             }),
         }
     }

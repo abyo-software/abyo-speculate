@@ -125,6 +125,29 @@ Two integration tests cover the Medusa story end-to-end:
 Speedup numbers will land in this section once we measure on a 24 GB+
 card. The plumbing is verified; only the headline number is pending.
 
+## Q4 target AR — also worth measuring
+
+`tests/with_qwen2_q4_cross_dtype.rs` (#[ignore]) sets up the Q4 7B
+target + BF16 0.5B draft pair. Vanilla SD itself can't run on this
+combo because the GGUF target has vocab 152064 (padded) while the
+0.5B safetensors draft has 151936 — the v0.x SD path requires
+matching vocabularies. The benchmark still measures the AR baseline:
+
+| Target (RTX 4070 Ti SUPER) | AR tok/s |
+|----------------------------|---------:|
+| Qwen 2.5 7B **Q4_K_M** (`bartowski/Qwen2.5-7B-Instruct-GGUF`) | **99.5** |
+| Qwen 2.5 3B BF16 | 67.0 |
+| Qwen 2.5 0.5B BF16 | 230+ |
+
+The Q4 7B is **faster per-step than the BF16 3B** despite having more
+parameters: weights are 4× smaller (~4 GB vs 6 GB) so the per-token
+memory-bandwidth cost drops. With AR at ~10 ms/token, no current SD
+method can amortize its per-round overhead enough to win. This is an
+even harder regime for SD than the BF16 paths.
+
+(Vocab-aligned Q4 target/draft pair would be a clean v0.5 follow-up
+test, but the speedup ceiling is structurally unfavorable.)
+
 ## EAGLE-2 / EAGLE-3 (v0.3.0)
 
 ### EAGLE on Q4 targets — honest negative result

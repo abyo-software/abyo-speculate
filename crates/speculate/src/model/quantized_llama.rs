@@ -400,7 +400,7 @@ impl LlamaQuantDecoder {
     /// from the tree forward, we just keep them and drop the rest.
     ///
     /// `accepted_indices` are tree node indices in BFS order from the root
-    /// (e.g. `[0, 1, 4]` = root → child[1] → grandchild[0] of child[1]).
+    /// (e.g. `[0, 1, 4]` = root → child\[1\] → grandchild\[0\] of child\[1\]).
     /// Index 0 (root) is always present and equals the previous
     /// `last_committed` token.
     ///
