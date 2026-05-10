@@ -40,6 +40,10 @@ pub struct Qwen2Decoder {
     vocab_size: usize,
     hidden_size: usize,
     eos_token_ids: Vec<u32>,
+    /// Cached next-token logits set by the most recent `forward_advance`
+    /// (called from `observe`). Returned by `next_logits` to skip a
+    /// redundant truncate-and-replay forward (~2× AR speedup).
+    last_logits: Option<Vec<f32>>,
     /// Mirrors `model.kv_cache_len()`. Maintained explicitly so we can avoid
     /// querying the model on hot paths.
     cache_len: usize,
@@ -108,6 +112,7 @@ impl Qwen2Decoder {
             vocab_size: config.vocab_size,
             hidden_size: config.hidden_size,
             eos_token_ids,
+            last_logits: None,
             cache_len: 0,
         })
     }
@@ -160,6 +165,11 @@ impl Qwen2Decoder {
         let logits = self.lm_head.forward(&hidden).map_err(Error::Candle)?;
         let logits = logits.i((0, .., ..)).map_err(Error::Candle)?;
         self.cache_len += tokens.len();
+        // Cache the LAST row's logits as the next-token prediction so
+        // `next_logits` doesn't redundantly re-forward (~2× AR speedup).
+        let n_rows = logits.dim(0).map_err(Error::Candle)?;
+        let last_row = logits.i((n_rows - 1, ..)).map_err(Error::Candle)?;
+        self.last_logits = Some(self.row_to_vec(&last_row)?);
         Ok(logits)
     }
 
@@ -318,6 +328,7 @@ impl Decoder for Qwen2Decoder {
         self.history.clear();
         self.model.clear_kv_cache();
         self.cache_len = 0;
+        self.last_logits = None;
     }
 
     fn observe(&mut self, ids: &[u32]) -> Result<()> {
@@ -335,9 +346,12 @@ impl Decoder for Qwen2Decoder {
                 "next_logits called with empty history".into(),
             ));
         }
-        // Truncate the cache by 1 (drop the last committed token), then
-        // re-forward it to recover its next-token logits. O(1) tensor slice
-        // + 1 forward pass instead of full clear+replay.
+        // Fast path: prior `forward_advance` already cached the next-token
+        // prediction as a side effect of `observe`.
+        if let Some(cached) = &self.last_logits {
+            return Ok(cached.clone());
+        }
+        // Slow path: cache invalidated (post tree mutation).
         let last = *self.history.last().unwrap();
         let target_len = self.history.len() - 1;
         self.model
@@ -395,6 +409,7 @@ impl Decoder for Qwen2Decoder {
             )));
         }
         self.history.truncate(len);
+        self.last_logits = None;
         self.model
             .truncate_kv_cache_to(len)
             .map_err(Error::Candle)?;

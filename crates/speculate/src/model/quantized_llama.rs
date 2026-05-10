@@ -29,6 +29,10 @@ pub struct LlamaQuantDecoder {
     device: Device,
     vocab_size: usize,
     hidden_size: usize,
+    /// Cached next-token logits set by every `forward_advance_logits` call;
+    /// returned by `next_logits` to skip the redundant truncate-and-replay
+    /// (~2× AR speedup). Invalidated on reset/rollback/tree mutations.
+    last_logits: Option<Vec<f32>>,
     eos_token_ids: Vec<u32>,
     cache_len: usize,
 }
@@ -88,6 +92,7 @@ impl LlamaQuantDecoder {
             hidden_size,
             eos_token_ids,
             cache_len: 0,
+            last_logits: None,
         })
     }
 
@@ -143,6 +148,12 @@ impl LlamaQuantDecoder {
         let logits = self.model.apply_lm_head(&hidden).map_err(Error::Candle)?;
         let logits = logits.i((0, .., ..)).map_err(Error::Candle)?;
         self.cache_len += tokens.len();
+        // Cache the LAST row's logits as the next-token prediction so a
+        // subsequent next_logits doesn't re-forward the last committed
+        // token (~2× AR speedup on Q4 paths).
+        let n_rows = logits.dim(0).map_err(Error::Candle)?;
+        let last_row = logits.i((n_rows - 1, ..)).map_err(Error::Candle)?;
+        self.last_logits = Some(self.row_to_vec(&last_row)?);
         Ok(logits)
     }
 
@@ -331,6 +342,8 @@ impl LlamaQuantDecoder {
         &mut self,
         tree: &DraftTree,
     ) -> Result<(Vec<Vec<f32>>, Vec<Tensor>)> {
+        // Cache state will diverge from history; invalidate cached logits.
+        self.last_logits = None;
         if self.history.is_empty() {
             return Err(Error::Sampling("tree_logits with empty history".into()));
         }
@@ -398,6 +411,8 @@ impl LlamaQuantDecoder {
         tree: &DraftTree,
         accepted_indices: &[usize],
     ) -> Result<()> {
+        // KV reorder doesn't run a forward, so cached logits are stale.
+        self.last_logits = None;
         if self.history.is_empty() {
             return Err(Error::Sampling(
                 "commit_tree_path with empty history".into(),
@@ -498,6 +513,7 @@ impl Decoder for LlamaQuantDecoder {
         self.history.clear();
         self.model.clear_kv_cache();
         self.cache_len = 0;
+        self.last_logits = None;
     }
 
     fn observe(&mut self, ids: &[u32]) -> Result<()> {
@@ -515,6 +531,12 @@ impl Decoder for LlamaQuantDecoder {
                 "next_logits called with empty history".into(),
             ));
         }
+        // Fast path: prior `forward_advance_logits` (called from observe)
+        // already cached the next-token logits.
+        if let Some(cached) = &self.last_logits {
+            return Ok(cached.clone());
+        }
+        // Slow path: truncate-and-replay (used after tree mutations).
         let last = *self.history.last().unwrap();
         let target_len = self.history.len() - 1;
         self.model
@@ -565,6 +587,7 @@ impl Decoder for LlamaQuantDecoder {
             )));
         }
         self.history.truncate(len);
+        self.last_logits = None;
         self.model
             .truncate_kv_cache_to(len)
             .map_err(Error::Candle)?;

@@ -12,12 +12,22 @@ Pure Rust [Speculative Decoding](https://arxiv.org/abs/2211.17192) library for
 abyo-speculate provides multiple Speculative Decoding (SD) algorithms behind
 a unified Rust API:
 
-| Method | Status (v0.3.0) | Measured speedup* |
+| Method | Status (v0.4.1) | Measured speedup* |
 |--------|------------------|-------------------|
-| Vanilla SD (Leviathan 2023) | ✅ shipped | **1.41–1.74×** (see below) |
-| Medusa (Cai 2024) | ✅ shipped (loader + reference loop) | TBD on real heads |
-| EAGLE-2 (Li 2024) | ✅ shipped (loader + Cartesian + dynamic tree) | depends on target dtype — see EAGLE notes |
-| EAGLE-3 (Li 2025) | ✅ shipped (multi-layer feature fusion + d2t/t2d) | depends on target dtype — see EAGLE notes |
+| Vanilla SD (Leviathan 2023) | ✅ shipped | **0.78–1.13×** vs optimized AR |
+| Medusa (Cai 2024) | ✅ shipped (loader + reference loop) | full speedup needs ≥24 GB GPU |
+| EAGLE-2 (Li 2024) | ✅ shipped (KV-reorder fast path) | 0.46× on consumer 16 GB |
+| EAGLE-3 (Li 2025) | ✅ shipped (multi-layer + d2t/t2d) | 0.62× on EC2 L4 24 GB |
+
+> **v0.4.1 honesty pivot.** Earlier releases reported a 1.4–1.7× speedup
+> for vanilla SD that was inflated by an inefficient AR baseline (the
+> `next_logits` impl was doing a redundant forward per token). v0.4.1
+> caches the next-token logits as a side effect of `observe`, making AR
+> ~2× faster — and revealing that SD methods on candle's current BF16
+> inference path are roughly break-even with AR for most task / model
+> combinations on a consumer 16 GB GPU. The crate's value is "correct,
+> reference SD implementations + honest measurement infrastructure",
+> not "drop-in speedup." See [`BENCHMARKS.md`](./BENCHMARKS.md).
 
 \* Qwen 2.5 3B target + Qwen 2.5 0.5B draft, k = 4, RTX 4070 Ti SUPER, BF16.
 See [`BENCHMARKS.md`](./BENCHMARKS.md).
@@ -82,49 +92,47 @@ let engine = SpeculateEngine::preset_for("qwen-2.5-7b")?;
 
 ### Vanilla SD on Qwen 2.5 BF16 (RTX 4070 Ti SUPER, 128 tokens, k = 4)
 
-Qwen 2.5 3B target + Qwen 2.5 0.5B draft (re-measured at v0.3.0):
+Qwen 2.5 3B target + Qwen 2.5 0.5B draft, re-measured at v0.4.1
+against an **optimized** AR baseline (no redundant per-token forward):
 
 | Task | AR tok/s | SD tok/s | Speedup |
 |------|---------:|---------:|--------:|
-| chat | 34.4 | 49.5 | **1.44×** |
-| **code** | **35.3** | **61.4** | **1.74×** |
-| translation | 34.1 | 48.0 | **1.41×** |
-| long_context | 31.5 | 49.6 | **1.57×** |
+| chat | 67.0 | 64.6 | 0.96× |
+| **code** | **67.4** | **76.1** | **1.13×** |
+| translation | 65.3 | 59.6 | 0.91× |
+| long_context | 62.4 | 48.5 | 0.78× |
 
-Code generation wins — its tokens are the most predictable.
+Only code generation crosses 1× — its tokens (whitespace, brackets,
+common keywords) are the most predictable, so per-round acceptance is
+high enough to amortize the SD overhead. Chat / translation /
+long-context lose against this hardware's per-AR-token cost.
 
-### EAGLE on consumer 16 GB hardware
+### EAGLE on consumer 16 GB GPU + EC2 L4 24 GB
 
-v0.4.0 cut EAGLE per-round target overhead from 4 → 2 forwards via KV
-`index_select` reordering (the accepted nodes' KVs are already in cache
-from the tree forward — the v0.3.x loop was throwing them away and
-re-forwarding the accepted path). This collapsed our EAGLE-2 BF16
-benchmark from 0.49× to **0.92× of AR** — essentially break-even on
-Llama 2 7B Chat MHA on a single 16 GB GPU.
+| Config | AR tok/s | EAGLE tok/s | Speedup |
+|--------|---------:|------------:|--------:|
+| Llama 2 7B BF16 + EAGLE-llama2-chat-7B (depth=2 k=2, RTX 4070 Ti SUPER) | 43.7 | 20.2 | **0.46×** |
+| Llama 3 8B Q4_K_M + EAGLE-LLaMA3-8B (RTX 4070 Ti SUPER) | 47.0 | 10.6 | 0.23× |
+| Llama 3.1 8B Q4_K_M + EAGLE3-LLaMA3.1-8B (RTX 4070 Ti SUPER) | 47.6 | 10.9 | 0.23× |
+| Llama 3.1 8B BF16 + EAGLE3-LLaMA3.1-8B (EC2 L4 24 GB) | 8.2 | 5.1 | 0.62× |
 
-| Config (after v0.4.0 KV reorder) | AR tok/s | EAGLE tok/s | Speedup |
-|----------------------------------|---------:|------------:|--------:|
-| Llama 2 7B BF16 + EAGLE-llama2-chat-7B (depth=2 k=2) | 21.6 | 19.9 | **0.92×** |
-| Llama 3 8B Q4_K_M + EAGLE-LLaMA3-8B (depth=4 k=2 dyn=16) | 47.0 | 10.6 | 0.23× |
-| Llama 3.1 8B Q4_K_M + EAGLE3-LLaMA3.1-8B (depth=4 k=2 dyn=16) | 47.6 | 10.9 | 0.23× |
+**EAGLE on candle's BF16 inference path doesn't beat AR on any tested
+config.** Per-round overhead (tree forward + bonus forward + draft) is
+larger than the per-AR-token cost candle achieves on these GPUs. The
+v0.4.0 KV-reorder fast path is in place (eliminates 2 of the 4
+per-round target forwards a naive impl needs); the remaining gap is
+candle's lack of Flash Attention / kernel fusion — features
+production frameworks like vLLM use to make per-step AR much more
+expensive, which is what amortizes EAGLE's per-round work in the
+published paper.
 
-The Q4 paths still lag — Q4 lm_head is a ~50 ms per-call bottleneck the
-fast-path can't avoid, and the FP16-trained drafts mismatch Q4 hiddens.
-The BF16 7B Chat number is the headline EAGLE config we ship as a
-worked example (`examples/eagle2_bf16.rs`); on bigger / GQA targets
-the same fast path should comfortably exceed 1× — Llama 3 8B BF16 +
-EAGLE3 on a ≥ 24 GB GPU is the canonical "EAGLE wins" configuration
-the published paper measures (we don't have the hardware to repro
-that single-card; the implementation is ready for it).
+Greedy-acceptance correctness is preserved by the v0.2.2 GEMV
+root-fix in the strict path; the fast path may diverge from AR by a
+token on borderline-argmax prompts.
 
-Greedy-acceptance correctness is preserved by the v0.2.2
-`tree_logits[0] == next_logits` invariant for the strict path; the
-fast path skips the GEMV root-fix to dodge a third forward and may
-diverge from AR by a token or two on shallow-acceptance prompts (a
-strict-mode v0.4.x toggle is on the roadmap).
-
-For a **demonstrably ≥1×** SD path today, **use Vanilla SD with a
-Qwen 2.5 target+draft pair** as documented above.
+EAGLE's value here is reference correctness + the infrastructure to
+re-evaluate on faster inference frameworks as candle adds them, not a
+production speedup today.
 
 We do **not** quote a single headline ratio — see
 [`BENCHMARKS.md`](./BENCHMARKS.md) for the full table including

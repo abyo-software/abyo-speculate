@@ -35,6 +35,7 @@ pub struct Qwen2QuantDecoder {
     hidden_size: usize,
     eos_token_ids: Vec<u32>,
     cache_len: usize,
+    last_logits: Option<Vec<f32>>,
 }
 
 impl std::fmt::Debug for Qwen2QuantDecoder {
@@ -98,6 +99,7 @@ impl Qwen2QuantDecoder {
             hidden_size,
             eos_token_ids,
             cache_len: 0,
+            last_logits: None,
         })
     }
 
@@ -143,6 +145,9 @@ impl Qwen2QuantDecoder {
         let logits = self.model.apply_lm_head(&hidden).map_err(Error::Candle)?;
         let logits = logits.i((0, .., ..)).map_err(Error::Candle)?;
         self.cache_len += tokens.len();
+        let n_rows = logits.dim(0).map_err(Error::Candle)?;
+        let last_row = logits.i((n_rows - 1, ..)).map_err(Error::Candle)?;
+        self.last_logits = Some(self.row_to_vec(&last_row)?);
         Ok(logits)
     }
 
@@ -271,6 +276,7 @@ impl Decoder for Qwen2QuantDecoder {
         self.history.clear();
         self.model.clear_kv_cache();
         self.cache_len = 0;
+        self.last_logits = None;
     }
 
     fn observe(&mut self, ids: &[u32]) -> Result<()> {
@@ -287,6 +293,9 @@ impl Decoder for Qwen2QuantDecoder {
             return Err(Error::Sampling(
                 "next_logits called with empty history".into(),
             ));
+        }
+        if let Some(cached) = &self.last_logits {
+            return Ok(cached.clone());
         }
         let last = *self.history.last().unwrap();
         let target_len = self.history.len() - 1;
@@ -338,6 +347,7 @@ impl Decoder for Qwen2QuantDecoder {
             )));
         }
         self.history.truncate(len);
+        self.last_logits = None;
         self.model
             .truncate_kv_cache_to(len)
             .map_err(Error::Candle)?;

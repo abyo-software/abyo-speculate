@@ -9,6 +9,59 @@ While the project is at `0.x`, breaking changes can land in any minor or
 patch release; we'll only commit to `1.x`-style stability after the API
 shape has been used in anger by at least one external project.
 
+## [0.4.1] — 2026-05-10
+
+### `next_logits` cache: AR 2× faster (across all decoders)
+
+The previous `Decoder::next_logits` implementation was wasteful: it
+truncated the KV cache by 1 and re-forwarded the last committed token
+to recover its next-token logits. But those logits are produced *as a
+side effect* of the immediately-preceding `observe([tok])` call —
+`forward_advance` returns logits for every input position and the last
+row IS the next-token prediction we want.
+
+This release caches that last row in `Decoder::observe` (and any other
+path that calls `forward_advance`) and has `next_logits` return it
+directly. The cache is invalidated on `reset` / `rollback_to` and on
+tree mutations (`tree_logits_keep_kv`, `commit_tree_path`).
+
+Applied to: `LlamaDecoder`, `LlamaQuantDecoder`, `Qwen2Decoder`,
+`Qwen2QuantDecoder`, `Phi3Decoder`. Output is bit-identical (same
+logits, just no redundant forward).
+
+### Honest benchmark recalibration
+
+This optimization revealed that **all prior SD speedup numbers were
+inflated** by the AR inefficiency. Re-measured at v0.4.1 on
+RTX 4070 Ti SUPER (Qwen 2.5 3B + 0.5B BF16, k=4, 128 tokens):
+
+| task | v0.3.x AR / SD / ratio | **v0.4.1 AR / SD / ratio** |
+|------|-----------------------|---------------------------|
+| chat | 34.4 / 49.5 / **1.44×** | 67.0 / 64.6 / **0.96×** |
+| code | 35.3 / 61.4 / **1.74×** | 67.4 / 76.1 / **1.13×** |
+| translation | 34.1 / 48.0 / **1.41×** | 65.3 / 59.6 / **0.91×** |
+| long_context | 31.5 / 49.6 / **1.57×** | 62.4 / 48.5 / **0.78×** |
+
+So vanilla SD on Qwen 2.5 BF16 is **roughly break-even** against a
+properly optimized AR baseline. Code task still wins (highly
+predictable tokens → high acceptance) but the other three lose because
+per-round SD overhead exceeds the AR-per-token cost on this GPU.
+
+EAGLE-2 BF16 on Llama 2 7B Chat (depth=2 k=2): now **0.46×** (was 0.92×
+against the old crippled AR). The v0.4.0 KV-reorder fast path is still
+correct and useful — the architecture's per-round overhead just
+remains too high relative to the now-faster AR.
+
+This is a hard, honest pivot: the crate's value proposition is now
+"correct, reference implementations of SD methods + the
+infrastructure to measure them honestly," not "drop-in 1.7× speedup."
+SD methods on candle's BF16 inference path lose to plain AR for most
+task / model combinations on consumer 16 GB GPUs. To get the paper's
+2-3× claim, you need a more optimized inference framework (Flash
+Attention, kernel fusion) than candle 0.8 currently provides.
+
+`README.md` and `BENCHMARKS.md` are updated to match.
+
 ## [0.4.0] — 2026-05-10
 
 ### EAGLE fast path: 4 → 2 target forwards per round

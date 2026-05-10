@@ -31,14 +31,23 @@ Models are pulled from Hugging Face on first run and cached at
 ## Per-task: Qwen 2.5 3B + 0.5B draft, k=4 (vanilla SD, BF16)
 
 128 new tokens, temperature 0.7, top_p 0.95, 1 warmup + 3 runs each.
-Re-measured at v0.3.0 (numbers below are the **mean of 3 runs**).
+Re-measured at **v0.4.1 against optimized AR** (no redundant forward
+per token — see CHANGELOG):
 
 | Task | AR tok/s | SD tok/s | Speedup |
 |------|---------:|---------:|--------:|
-| chat | 34.4 | 49.5 | **1.44×** |
-| **code** | **35.3** | **61.4** | **1.74×** |
-| translation | 34.1 | 48.0 | **1.41×** |
-| long_context | 31.5 | 49.6 | **1.57×** |
+| chat | 67.0 | 64.6 | 0.96× |
+| **code** | **67.4** | **76.1** | **1.13×** |
+| translation | 65.3 | 59.6 | 0.91× |
+| long_context | 62.4 | 48.5 | 0.78× |
+
+> **v0.4.1 honesty pivot.** The previous v0.3 / v0.4.0 table reported
+> 1.4–1.7× for these same tasks. That number compared SD against an AR
+> baseline that was doing 2 forwards per token (cache truncate-and-replay
+> in `next_logits` instead of caching the next-token logits as a side
+> effect of `observe`). Fixing AR — bit-identical output, just no
+> redundant forward — also halved the SD speedup ratio. The new numbers
+> are the apples-to-apples comparison.
 
 `code` wins by a wide margin — coding tokens are highly predictable
 (whitespace, brackets, common keywords), so the draft model's acceptance

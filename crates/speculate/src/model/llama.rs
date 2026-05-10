@@ -36,6 +36,14 @@ pub struct LlamaDecoder {
     hidden_size: usize,
     eos_token_ids: Vec<u32>,
     cache_len: usize,
+    /// Cached next-token logits from the most recent `forward_advance` /
+    /// `observe` call. The previous AR loop pattern (observe → next_logits)
+    /// did 2 model forwards per token because next_logits would
+    /// truncate-and-replay the last committed token; caching the logits
+    /// produced as a side-effect of `observe` lets `next_logits` return
+    /// them directly. Invalidated on `reset`, `rollback_to`, and
+    /// tree_logits / commit_tree_path (those mutate cache).
+    last_logits: Option<Vec<f32>>,
 }
 
 impl std::fmt::Debug for LlamaDecoder {
@@ -110,6 +118,7 @@ impl LlamaDecoder {
             hidden_size: config.hidden_size,
             eos_token_ids,
             cache_len: 0,
+            last_logits: None,
         })
     }
 
@@ -158,6 +167,13 @@ impl LlamaDecoder {
         let logits = self.lm_head.forward(&hidden).map_err(Error::Candle)?;
         let logits = logits.i((0, .., ..)).map_err(Error::Candle)?;
         self.cache_len += tokens.len();
+        // Cache the LAST row's logits — that's the next-token prediction
+        // for `cache_len + 1` (i.e. one past the last appended token).
+        // Subsequent `next_logits()` calls return this without a redundant
+        // truncate-and-replay forward (~2× AR speedup).
+        let n_rows = logits.dim(0).map_err(Error::Candle)?;
+        let last_row = logits.i((n_rows - 1, ..)).map_err(Error::Candle)?;
+        self.last_logits = Some(self.row_to_vec(&last_row)?);
         Ok(logits)
     }
 
@@ -337,6 +353,9 @@ impl LlamaDecoder {
         &mut self,
         tree: &DraftTree,
     ) -> Result<(Vec<Vec<f32>>, Vec<Tensor>)> {
+        // Cache state will diverge from history; invalidate the cached
+        // next-token logits so a subsequent next_logits doesn't read stale.
+        self.last_logits = None;
         if self.history.is_empty() {
             return Err(Error::Sampling("tree_logits with empty history".into()));
         }
@@ -390,6 +409,9 @@ impl LlamaDecoder {
         tree: &DraftTree,
         accepted_indices: &[usize],
     ) -> Result<()> {
+        // KV reorder doesn't run a forward, so the previously cached
+        // next-token logits no longer correspond to the new last_committed.
+        self.last_logits = None;
         if self.history.is_empty() {
             return Err(Error::Sampling(
                 "commit_tree_path with empty history".into(),
@@ -492,6 +514,7 @@ impl Decoder for LlamaDecoder {
         self.history.clear();
         self.cache.clear();
         self.cache_len = 0;
+        self.last_logits = None;
     }
 
     fn observe(&mut self, ids: &[u32]) -> Result<()> {
@@ -509,6 +532,13 @@ impl Decoder for LlamaDecoder {
                 "next_logits called with empty history".into(),
             ));
         }
+        // Fast path: the last `forward_advance` (or `observe`, which calls
+        // it) cached the next-token logits as a side effect. Use them.
+        if let Some(cached) = &self.last_logits {
+            return Ok(cached.clone());
+        }
+        // Slow path: cache was invalidated (post-rollback or post-tree
+        // operation). Truncate-and-replay the last token to recompute.
         let last = *self.history.last().unwrap();
         let target_len = self.history.len() - 1;
         self.cache.truncate_to(target_len).map_err(Error::Candle)?;
@@ -557,6 +587,7 @@ impl Decoder for LlamaDecoder {
         self.history.truncate(len);
         self.cache.truncate_to(len).map_err(Error::Candle)?;
         self.cache_len = len;
+        self.last_logits = None;
         Ok(())
     }
 }
