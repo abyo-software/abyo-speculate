@@ -753,8 +753,20 @@ where
         if committed.is_empty() {
             return Err(Error::Sampling("EAGLE-3 round committed zero tokens".into()));
         }
+
+        // Honour the target's EOS set so we stop on natural end-of-text.
+        let eos_set = target.eos_token_ids();
+        let eos_pos = committed.iter().position(|t| eos_set.contains(t));
+        let stop = eos_pos.is_some();
+        if let Some(p) = eos_pos {
+            committed.truncate(p + 1);
+        }
+
         target.observe(&committed)?;
         generated.extend_from_slice(&committed);
+        if stop {
+            break;
+        }
     }
     let _ = (rng, config.temperature, config.top_p);
     generated.truncate(max_new_tokens);

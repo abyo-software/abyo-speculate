@@ -638,8 +638,21 @@ where
             return Err(Error::Sampling("EAGLE round committed zero tokens".into()));
         }
 
+        // Truncate at EOS so we don't generate garbage past the natural
+        // stopping point. The target's `eos_token_ids()` defines the stop
+        // set (e.g. Llama 3 uses {128001, 128009}, Llama 2 uses {2}).
+        let eos_set = target.eos_token_ids();
+        let eos_pos = committed.iter().position(|t| eos_set.contains(t));
+        let stop = eos_pos.is_some();
+        if let Some(p) = eos_pos {
+            committed.truncate(p + 1); // include the EOS token in the output
+        }
+
         target.observe(&committed)?;
         generated.extend_from_slice(&committed);
+        if stop {
+            break;
+        }
     }
     // Suppress unused-rng warning until temperature > 0 lands.
     let _ = (rng, config.temperature, config.top_p);

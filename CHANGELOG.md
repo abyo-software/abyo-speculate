@@ -9,6 +9,22 @@ While the project is at `0.x`, breaking changes can land in any minor or
 patch release; we'll only commit to `1.x`-style stability after the API
 shape has been used in anger by at least one external project.
 
+## [0.3.1] — 2026-05-10
+
+### EOS support in `run_eagle` and `run_eagle3`
+
+Both EAGLE run loops now check `target.eos_token_ids()` against each
+committed batch and break out of the round loop when an EOS token is
+emitted (the EOS token itself is included in the output). Previously
+the loops kept generating until `max_new_tokens`, producing nonsense
+past the natural end of a chat reply.
+
+This fixes the visible regression in the BF16 EAGLE-2 e2e test where
+the haiku prompt would correctly produce
+`Sure! ... Serenity found` and then keep going into unrelated text.
+EAGLE now stops on EOS the same way `Decoder::next_logits` /
+`SpeculateEngine::generate_tokens_with` already does.
+
 ## [0.3.0] — 2026-05-10
 
 ### EAGLE on the architecture it was actually trained for (BF16)
