@@ -558,6 +558,9 @@ impl Decoder for LlamaQuantDecoder {
         if self.history.is_empty() {
             return Err(Error::Sampling("batched_logits with empty history".into()));
         }
+        // Truncate-and-replay on purpose — see Qwen2Decoder for the
+        // explanation (cached-logits opt hurts SD acceptance via
+        // GEMV/GEMM precision drift on the last token's KV).
         let last = *self.history.last().unwrap();
         let target_len = self.history.len() - 1;
         self.model

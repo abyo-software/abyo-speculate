@@ -558,6 +558,13 @@ impl Decoder for LlamaDecoder {
         if self.history.is_empty() {
             return Err(Error::Sampling("batched_logits with empty history".into()));
         }
+        // We keep the truncate-and-replay of `last` here on purpose: a
+        // "skip last via cached_logits" optimization (analogous to v0.4.1
+        // next_logits) measurably *hurts* SD acceptance because last
+        // committed token's KV from observe (GEMV path) differs from the
+        // GEMM-path KV the drafts attend against in a single batched
+        // forward. The drift lowers acceptance enough to net 25-35%
+        // worse on chat/translation tasks.
         let last = *self.history.last().unwrap();
         let target_len = self.history.len() - 1;
         self.cache.truncate_to(target_len).map_err(Error::Candle)?;

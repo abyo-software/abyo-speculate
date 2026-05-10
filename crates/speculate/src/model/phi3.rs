@@ -290,6 +290,7 @@ impl Decoder for Phi3Decoder {
         if self.history.is_empty() {
             return Err(Error::Sampling("batched_logits with empty history".into()));
         }
+        // Truncate-and-replay on purpose — see Qwen2Decoder for rationale.
         let last = *self.history.last().unwrap();
         let target_len = self.history.len() - 1;
         self.model

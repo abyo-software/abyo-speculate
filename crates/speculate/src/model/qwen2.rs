@@ -373,9 +373,14 @@ impl Decoder for Qwen2Decoder {
         if self.history.is_empty() {
             return Err(Error::Sampling("batched_logits with empty history".into()));
         }
-
         // Truncate cache by 1, re-feed [last_committed, drafts...] in one
-        // forward pass to get k+1 logit rows.
+        // forward pass to get k+1 logit rows. We keep the truncate-and-replay
+        // here on purpose: a "skip last via cached_logits" optimization
+        // (similar to v0.4.1 next_logits) measurably *hurts* SD acceptance
+        // because the last token's KV from the prior observe (GEMV path)
+        // differs slightly from the GEMM-path KV the drafts compute their
+        // attention against here. The numerical drift lowers acceptance
+        // enough that SD throughput drops 25-35% on chat/translation tasks.
         let last = *self.history.last().unwrap();
         let target_len = self.history.len() - 1;
         self.model
