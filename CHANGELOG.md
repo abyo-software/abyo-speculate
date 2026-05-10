@@ -9,6 +9,47 @@ While the project is at `0.x`, breaking changes can land in any minor or
 patch release; we'll only commit to `1.x`-style stability after the API
 shape has been used in anger by at least one external project.
 
+## [0.2.2] — 2026-05-10
+
+### tree_logits multi-position correctness fix
+
+Root cause for the v0.2.1 EAGLE-3 divergence: candle's QMatMul takes a
+GEMV path for `seq_len == 1` but a GEMM path for `seq_len > 1`, and the
+two have different FP accumulation orders. On Q4 × 128k vocab, the
+per-token logit values drift by ~0.01–0.05 across tree sizes — enough
+to flip a borderline argmax (e.g. ` a` vs ` Paris` differ by 0.02 at
+the end of "The capital of France is").
+
+Fix in `LlamaQuantDecoder::tree_logits`: overwrite `per_node_logits[0]`
+with the GEMV-path logits captured at the restoration
+`forward_advance_logits([last_committed])` step that already runs after
+the tree forward. The root row is now bit-for-bit identical to
+`next_logits`; deeper rows still go through the GEMM path but are only
+consulted after the corresponding draft token is accepted (i.e. matches
+root's argmax, which is what the bonus-or-accept logic uses).
+
+### EAGLE-3 e2e (Llama 3.1 8B Q4_K_M, depth=4 k=2 dyn=16, 32 tokens)
+
+```text
+AR baseline : 45.82 tok/s
+EAGLE-3     :  9.53 tok/s   (0.21× — output now matches AR exactly)
+```
+
+Output is now byte-for-byte the AR trajectory (greedy acceptance over
+the corrected tree). Speed is bounded by Q4 quantization: EAGLE-3 was
+trained on FP16 target hidden states, but we feed Q4 hiddens, so the
+draft's predictions diverge from target's argmax often enough that
+acceptance amortises poorly. Closing the speed gap further requires
+either a BF16 target (≥ 24 GB GPU) or an EAGLE-3 retrained on the Q4
+feature distribution.
+
+### Tests
+
+`tests/tree_logits_consistency.rs` (gated under `#[ignore]`) now
+**passes** — sweeps 1, 2, 3, 4, 5, 8, 16, 32-node linear chains plus
+the 31-node Cartesian and asserts `tree_logits[0] argmax == next_logits
+argmax` on Llama 3.1 8B Q4_K_M.
+
 ## [0.2.1] — 2026-05-10
 
 ### EAGLE-3 reference-matching architecture

@@ -44,24 +44,13 @@
 //!   `embed(root_token) + concat(low,mid,high)`; subsequent rounds pass
 //!   `embed(top1_drafted) + previous midlayer output`.
 //!
-//! ## Known v0.2.1 blocker (deferred to v0.2.2)
+//! ## v0.2.2: tree_logits multi-position bug fixed
 //!
-//! `LlamaQuantDecoder::tree_logits` returns a different root distribution
-//! than `next_logits` would for the same state when the tree has more
-//! than one node. Reproduction:
-//!
-//! ```text
-//! root=374        (the " is" token at the prompt's end)
-//! next_logits     argmax = 264   (" a")
-//! tree_logits(1)  argmax = 264   ✓
-//! tree_logits(31) argmax = 12366 (" Paris")  ✗
-//! ```
-//!
-//! The bug breaks greedy acceptance correctness — a fix in
-//! `quantized_llama_local::ModelWeights::forward_with_positions` (or in
-//! the attention-bias broadcast in `LayerWeights::run_attn`) is the
-//! v0.2.2 critical-path work. The regression test
-//! `tests/tree_logits_consistency.rs` captures the invariant.
+//! v0.2.1 isolated a Q4 GEMV-vs-GEMM precision drift in
+//! `LlamaQuantDecoder::tree_logits` that broke greedy acceptance on
+//! borderline argmax cases. v0.2.2 patched it (see CHANGELOG); EAGLE-3
+//! end-to-end now produces output identical to AR baseline. Speed
+//! remains bounded by Q4 quantization noise affecting draft accuracy.
 
 #![allow(missing_docs)]
 

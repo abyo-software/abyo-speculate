@@ -263,7 +263,19 @@ impl LlamaQuantDecoder {
             .truncate_kv_cache_to(prefix_len)
             .map_err(Error::Candle)?;
         self.cache_len = prefix_len;
-        let _ = self.forward_advance_logits(&[last_committed])?;
+        // Restoration step also gives us the GEMV-path logits for the
+        // root token. The multi-position GEMM path used inside the tree
+        // forward returns slightly different values for position 0 than
+        // a single-position forward would (independent FP accumulation
+        // order across kernel sizes — verified to drift by ~0.01-0.05
+        // across tree sizes 4 / 9 / 16, enough to flip a borderline
+        // argmax). Overwriting per_node_logits[0] with the restoration
+        // logits guarantees the invariant `tree_logits[0] == next_logits`.
+        let restore_logits = self.forward_advance_logits(&[last_committed])?;
+        let restore_row = restore_logits
+            .i((restore_logits.dim(0).map_err(Error::Candle)? - 1, ..))
+            .map_err(Error::Candle)?;
+        out[0] = self.row_to_vec(&restore_row)?;
         debug_assert_eq!(self.cache_len, pre_cache_len);
         Ok(out)
     }

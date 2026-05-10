@@ -227,8 +227,6 @@ impl DraftTree {
         let total = prefix_len + n;
         let mut data = vec![0f32; n * total];
         for i in 0..n {
-            // Prefix columns: 0.0 (already initialized).
-            // Tree-self columns:
             for j in 0..n {
                 if !self.is_ancestor_of(j, i) {
                     data[i * total + prefix_len + j] = f32::NEG_INFINITY;
