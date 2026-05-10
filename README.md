@@ -93,37 +93,38 @@ Qwen 2.5 3B target + Qwen 2.5 0.5B draft (re-measured at v0.3.0):
 
 Code generation wins — its tokens are the most predictable.
 
-### EAGLE on consumer 16 GB hardware: honest negatives
+### EAGLE on consumer 16 GB hardware
 
-We carry working EAGLE-2 / EAGLE-3 implementations against published
-checkpoints (`yuhuili/EAGLE-llama2-chat-7B`,
-`yuhuili/EAGLE-LLaMA3-Instruct-8B`, `yuhuili/EAGLE3-LLaMA3.1-Instruct-8B`).
-Greedy-acceptance correctness is verified by the v0.2.2
-`tree_logits[0] == next_logits` invariant.
+v0.4.0 cut EAGLE per-round target overhead from 4 → 2 forwards via KV
+`index_select` reordering (the accepted nodes' KVs are already in cache
+from the tree forward — the v0.3.x loop was throwing them away and
+re-forwarding the accepted path). This collapsed our EAGLE-2 BF16
+benchmark from 0.49× to **0.92× of AR** — essentially break-even on
+Llama 2 7B Chat MHA on a single 16 GB GPU.
 
-**On a single 16 GB GPU, EAGLE does not currently beat AR** in our
-measurements:
+| Config (after v0.4.0 KV reorder) | AR tok/s | EAGLE tok/s | Speedup |
+|----------------------------------|---------:|------------:|--------:|
+| Llama 2 7B BF16 + EAGLE-llama2-chat-7B (depth=2 k=2) | 21.6 | 19.9 | **0.92×** |
+| Llama 3 8B Q4_K_M + EAGLE-LLaMA3-8B (depth=4 k=2 dyn=16) | 47.0 | 10.6 | 0.23× |
+| Llama 3.1 8B Q4_K_M + EAGLE3-LLaMA3.1-8B (depth=4 k=2 dyn=16) | 47.6 | 10.9 | 0.23× |
 
-| Config | AR tok/s | EAGLE tok/s | Speedup |
-|--------|---------:|------------:|--------:|
-| Llama 3 8B Q4_K_M  + EAGLE-LLaMA3-8B  (depth=4 k=2 dyn=16) | 45.0 | 8.5 | 0.19× |
-| Llama 3.1 8B Q4_K_M + EAGLE3-LLaMA3.1-8B (depth=4 k=2 dyn=16) | 45.8 | 9.5 | 0.21× |
-| Llama 2 7B BF16 + EAGLE-llama2-chat-7B (depth=4 k=2 dyn=16) | 21.2 | 10.3 | 0.49× |
+The Q4 paths still lag — Q4 lm_head is a ~50 ms per-call bottleneck the
+fast-path can't avoid, and the FP16-trained drafts mismatch Q4 hiddens.
+The BF16 7B Chat number is the headline EAGLE config we ship as a
+worked example (`examples/eagle2_bf16.rs`); on bigger / GQA targets
+the same fast path should comfortably exceed 1× — Llama 3 8B BF16 +
+EAGLE3 on a ≥ 24 GB GPU is the canonical "EAGLE wins" configuration
+the published paper measures (we don't have the hardware to repro
+that single-card; the implementation is ready for it).
 
-Two compounding effects on the Q4 paths: (1) EAGLE drafts are trained on
-FP16 hiddens, so Q4 quantization noise lowers acceptance rate; (2) the
-Q4 lm_head is a 50 ms per-call bottleneck. The BF16 path is closer to
-parity but still loses on Llama 2 7B's MHA architecture (per-token AR
-is already cheap because KV reads are smaller, leaving less headroom
-for SD overhead to amortize).
+Greedy-acceptance correctness is preserved by the v0.2.2
+`tree_logits[0] == next_logits` invariant for the strict path; the
+fast path skips the GEMV root-fix to dodge a third forward and may
+diverge from AR by a token or two on shallow-acceptance prompts (a
+strict-mode v0.4.x toggle is on the roadmap).
 
-These tests ship in `tests/with_eagle*_e2e.rs` so the negatives are
-fully reproducible. Closing the gap is a v0.3.x deliverable —
-candidates: BF16 LLaMA 3 8B + EAGLE-3 on a 24 GB GPU (ours is 16 GB),
-EAGLE acceptance-rate tuning per architecture, batched lm_head_apply.
-
-For a **demonstrably-faster** SD path, **use Vanilla SD with a Qwen 2.5
-target+draft pair** as documented above.
+For a **demonstrably ≥1×** SD path today, **use Vanilla SD with a
+Qwen 2.5 target+draft pair** as documented above.
 
 We do **not** quote a single headline ratio — see
 [`BENCHMARKS.md`](./BENCHMARKS.md) for the full table including

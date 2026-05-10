@@ -169,4 +169,51 @@ pub trait TreeDecoder: Decoder {
             reason: "this TreeDecoder does not expose its embedding table".into(),
         })
     }
+
+    /// EAGLE-optimised tree forward. Returns `(per_node_logits,
+    /// per_node_hidden)` and **leaves the KV cache populated with the
+    /// tree** — no restoration. Use [`Self::commit_tree_path`] to commit
+    /// the accepted path. Default impl falls back to [`Self::tree_logits`]
+    /// without hidden states (for decoders that haven't implemented the
+    /// optimised path yet).
+    fn tree_logits_keep_kv(
+        &mut self,
+        tree: &crate::tree::DraftTree,
+    ) -> Result<(Vec<Vec<f32>>, Vec<candle_core::Tensor>)> {
+        let _ = tree;
+        Err(crate::Error::UnsupportedMethod {
+            method: "tree_logits_keep_kv",
+            reason: "this TreeDecoder hasn't implemented the EAGLE fast path yet".into(),
+        })
+    }
+
+    /// Like [`Decoder::observe`], but additionally returns the last
+    /// position's hidden state from the same forward pass. EAGLE chains
+    /// this into the next round's draft input. Default impl falls back
+    /// to `observe` + `last_hidden_state` (two forwards instead of one).
+    fn observe_returning_last_hidden(
+        &mut self,
+        ids: &[u32],
+    ) -> Result<candle_core::Tensor> {
+        self.observe(ids)?;
+        self.last_hidden_state()
+    }
+
+    /// Commit the accepted tree path produced by
+    /// [`Self::tree_logits_keep_kv`] without re-running the target — KV
+    /// reordering only. The `accepted_indices` are tree node indices in
+    /// BFS order from the root (e.g. `[0, 1, 4]`). Index 0 (root) is
+    /// always present. To add a bonus token after, follow up with a
+    /// normal [`Self::observe`] call.
+    fn commit_tree_path(
+        &mut self,
+        tree: &crate::tree::DraftTree,
+        accepted_indices: &[usize],
+    ) -> Result<()> {
+        let _ = (tree, accepted_indices);
+        Err(crate::Error::UnsupportedMethod {
+            method: "commit_tree_path",
+            reason: "this TreeDecoder hasn't implemented the EAGLE fast path yet".into(),
+        })
+    }
 }

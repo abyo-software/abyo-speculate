@@ -161,6 +161,27 @@ impl LlamaDecoder {
         Ok(logits)
     }
 
+    /// Like [`Decoder::observe`], but additionally returns the last
+    /// position's hidden state from the same forward pass.
+    pub fn observe_returning_last_hidden(&mut self, ids: &[u32]) -> Result<Tensor> {
+        if ids.is_empty() {
+            return Err(Error::Sampling(
+                "observe_returning_last_hidden with empty ids".into(),
+            ));
+        }
+        let input = Tensor::new(ids, &self.device)
+            .and_then(|t| t.unsqueeze(0))
+            .map_err(Error::Candle)?;
+        let hidden = self
+            .model
+            .forward(&input, self.cache_len, &mut self.cache)
+            .map_err(Error::Candle)?;
+        self.cache_len += ids.len();
+        self.history.extend_from_slice(ids);
+        let last_idx = hidden.dim(1).map_err(Error::Candle)? - 1;
+        hidden.i((0, last_idx, ..)).map_err(Error::Candle)
+    }
+
     /// See [`crate::model::qwen2::Qwen2Decoder::last_hidden_state`].
     pub fn last_hidden_state(&mut self) -> Result<Tensor> {
         if self.history.is_empty() {
@@ -307,6 +328,95 @@ impl LlamaDecoder {
     pub fn num_hidden_layers(&self) -> usize {
         self.model.num_hidden_layers()
     }
+
+    /// EAGLE-optimised tree forward: returns hidden states alongside
+    /// logits, leaves the KV cache populated with the tree (no
+    /// restoration), skips the v0.2.2 GEMV root-fix. Use [`Self::commit_tree_path`]
+    /// to commit the accepted path without re-forwarding.
+    pub fn tree_logits_keep_kv(
+        &mut self,
+        tree: &DraftTree,
+    ) -> Result<(Vec<Vec<f32>>, Vec<Tensor>)> {
+        if self.history.is_empty() {
+            return Err(Error::Sampling("tree_logits with empty history".into()));
+        }
+        let last_committed = *self.history.last().unwrap();
+        if tree.token_at(0) != last_committed {
+            return Err(Error::Sampling(format!(
+                "tree root ({}) must equal last committed token ({})",
+                tree.token_at(0),
+                last_committed
+            )));
+        }
+        let pre_cache_len = self.cache_len;
+        debug_assert_eq!(pre_cache_len, self.history.len());
+        let prefix_len = pre_cache_len - 1;
+
+        self.cache.truncate_to(prefix_len).map_err(Error::Candle)?;
+        self.cache_len = prefix_len;
+
+        let positions: Vec<u32> = (0..tree.len())
+            .map(|i| (prefix_len + tree.depth_of(i)) as u32)
+            .collect();
+        let position_tensor =
+            Tensor::from_vec(positions, (tree.len(),), &self.device).map_err(Error::Candle)?;
+        let bias = tree.full_attention_bias_4d(prefix_len, 1, 1, &self.device, self.dtype)?;
+        let input_ids = Tensor::from_slice(tree.tokens(), (1, tree.len()), &self.device)
+            .map_err(Error::Candle)?;
+
+        let hidden = self
+            .model
+            .forward_with_positions(&input_ids, &position_tensor, &bias, &mut self.cache)
+            .map_err(Error::Candle)?;
+        self.cache_len = prefix_len + tree.len();
+        let logits = self.lm_head.forward(&hidden).map_err(Error::Candle)?;
+        let logits = logits.i((0, .., ..)).map_err(Error::Candle)?;
+
+        let mut out_logits = Vec::with_capacity(tree.len());
+        let mut out_hidden = Vec::with_capacity(tree.len());
+        for i in 0..tree.len() {
+            let row = logits.i((i, ..)).map_err(Error::Candle)?;
+            out_logits.push(self.row_to_vec(&row)?);
+            out_hidden.push(hidden.i((0, i, ..)).map_err(Error::Candle)?);
+        }
+        Ok((out_logits, out_hidden))
+    }
+
+    /// Commit the accepted tree path to permanent KV state via index_select
+    /// reordering of the cache. See `LlamaQuantDecoder::commit_tree_path`
+    /// for the index-arithmetic explanation.
+    pub fn commit_tree_path(
+        &mut self,
+        tree: &DraftTree,
+        accepted_indices: &[usize],
+    ) -> Result<()> {
+        if self.history.is_empty() {
+            return Err(Error::Sampling(
+                "commit_tree_path with empty history".into(),
+            ));
+        }
+        debug_assert!(!accepted_indices.is_empty() && accepted_indices[0] == 0);
+        let last_committed = *self.history.last().unwrap();
+        let prefix_len = self.history.len() - 1;
+        debug_assert_eq!(tree.token_at(0), last_committed);
+
+        let mut keep: Vec<u32> = Vec::with_capacity(prefix_len + accepted_indices.len());
+        for i in 0..prefix_len {
+            keep.push(i as u32);
+        }
+        for &ti in accepted_indices {
+            keep.push((prefix_len + ti) as u32);
+        }
+        self.cache
+            .keep_kv_indices(&keep)
+            .map_err(Error::Candle)?;
+        self.cache_len = keep.len();
+
+        for &ti in accepted_indices.iter().skip(1) {
+            self.history.push(tree.token_at(ti));
+        }
+        Ok(())
+    }
 }
 
 impl crate::model::TreeDecoder for LlamaDecoder {
@@ -335,6 +445,25 @@ impl crate::model::TreeDecoder for LlamaDecoder {
 
     fn embed_tokens(&self, input_ids: &Tensor) -> Result<Tensor> {
         LlamaDecoder::embed_tokens(self, input_ids)
+    }
+
+    fn tree_logits_keep_kv(
+        &mut self,
+        tree: &DraftTree,
+    ) -> Result<(Vec<Vec<f32>>, Vec<Tensor>)> {
+        LlamaDecoder::tree_logits_keep_kv(self, tree)
+    }
+
+    fn observe_returning_last_hidden(&mut self, ids: &[u32]) -> Result<Tensor> {
+        LlamaDecoder::observe_returning_last_hidden(self, ids)
+    }
+
+    fn commit_tree_path(
+        &mut self,
+        tree: &DraftTree,
+        accepted_indices: &[usize],
+    ) -> Result<()> {
+        LlamaDecoder::commit_tree_path(self, tree, accepted_indices)
     }
 }
 

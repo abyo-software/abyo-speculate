@@ -9,6 +9,66 @@ While the project is at `0.x`, breaking changes can land in any minor or
 patch release; we'll only commit to `1.x`-style stability after the API
 shape has been used in anger by at least one external project.
 
+## [0.4.0] — 2026-05-10
+
+### EAGLE fast path: 4 → 2 target forwards per round
+
+Cuts per-round target overhead by **~50%** by eliminating three of the
+four target forwards the v0.3.x EAGLE loop was doing:
+
+1. **No more `last_hidden_state()`**: the new
+   `TreeDecoder::observe_returning_last_hidden(ids)` runs `observe`
+   AND returns the last position's hidden state from the same forward.
+   The deepest-committed token's hidden is chained directly into the
+   next round's draft input — no separate forward.
+2. **No more tree_logits restoration**: the new
+   `TreeDecoder::tree_logits_keep_kv(tree)` returns
+   `(per_node_logits, per_node_hidden)` and **leaves** the KV cache
+   populated with the tree (no restoration forward).
+3. **No more full `observe(committed)`**: the new
+   `TreeDecoder::commit_tree_path(tree, accepted_indices)` reorders
+   the per-layer KV cache via `index_select` to keep the prefix +
+   accepted nodes (and drop unaccepted siblings) — **zero extra
+   forwards**. Only the bonus token still goes through a one-token
+   `observe`.
+
+The tree forward already populated KV for every tree node; the v0.3.x
+implementation threw all of that away and re-forwarded the accepted
+path. The KV reorder gives us the same end state for free.
+
+### Measured speedup gain
+
+EAGLE-2 on Llama 2 7B Chat **BF16** + `yuhuili/EAGLE-llama2-chat-7B`
+(depth=2 k=2, 64 tokens, RTX 4070 Ti SUPER 16 GB):
+
+| Build | AR tok/s | EAGLE tok/s | Speedup vs AR |
+|-------|---------:|------------:|--------------:|
+| v0.3.1 (4 forwards/round) | 21.2 | 10.3 | 0.49× |
+| **v0.4.0 (2 forwards/round)** | **21.6** | **19.9** | **0.92×** |
+
+Per-prompt: haiku **0.97×**, capital-of-France-style 0.94×, RoPE
+explanation 0.91×. Output is byte-for-byte AR-matching for the
+acceptance-deep prompts (haiku); on shallow-acceptance prompts the
+trajectory may diverge a token or two due to GEMM precision drift on
+`per_node_logits[i > 0]` (the v0.2.2 GEMV root-fix is skipped on the
+fast path — strict mode is a v0.4.x follow-up).
+
+EAGLE-3 on Llama 3.1 8B Q4_K_M improves from **0.21× → 0.23×** — the
+Q4 lm_head per-call cost (~50 ms) still dominates this configuration
+and the fast path can't avoid it. BF16 GQA targets (Llama 3.1 8B BF16
+on a ≥ 24 GB GPU) are the configuration we'd expect to push past 1×.
+
+### New / changed APIs
+
+- `TreeDecoder::observe_returning_last_hidden(&mut self, &[u32]) -> Result<Tensor>`
+- `TreeDecoder::tree_logits_keep_kv(&mut self, &DraftTree) -> Result<(Vec<Vec<f32>>, Vec<Tensor>)>`
+- `TreeDecoder::commit_tree_path(&mut self, &DraftTree, &[usize]) -> Result<()>`
+- `Cache::keep_kv_indices(&[u32])` (BF16 path) and
+  `ModelWeights::keep_kv_indices(&[u32])` (Q4 path) for KV reordering.
+- `LlamaQuantDecoder::apply_lm_head` now auto-promotes BF16/F16 input
+  to F32 (the dtype the QMatMul kernel expects) — symmetrical with
+  `LlamaDecoder::apply_lm_head`'s existing auto-promote.
+
 ## [0.3.2] — 2026-05-10
 
 ### EAGLE-2 worked example

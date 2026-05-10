@@ -173,6 +173,17 @@ impl LayerWeights {
         }
         Ok(())
     }
+
+    fn keep_kv_indices(&mut self, idx_tensor: &Tensor) -> Result<()> {
+        if let Some((k, v)) = &self.kv_cache {
+            let k_c = k.contiguous()?;
+            let v_c = v.contiguous()?;
+            let new_k = k_c.index_select(idx_tensor, 2)?.contiguous()?;
+            let new_v = v_c.index_select(idx_tensor, 2)?.contiguous()?;
+            self.kv_cache = Some((new_k, new_v));
+        }
+        Ok(())
+    }
 }
 
 fn precomput_freqs_cis(
@@ -431,6 +442,23 @@ impl ModelWeights {
         for layer in self.layers.iter_mut() {
             layer.truncate_kv_cache_to(len)?;
         }
+        Ok(())
+    }
+
+    /// Reorder every per-layer KV cache so the new sequence is exactly the
+    /// rows at `indices` (in the given order). Used by EAGLE/EAGLE-3 to
+    /// commit the accepted tree path's KVs without re-running the target.
+    pub fn keep_kv_indices(&mut self, indices: &[u32]) -> Result<()> {
+        if indices.is_empty() {
+            self.clear_kv_cache();
+            return Ok(());
+        }
+        let idx_tensor = Tensor::from_slice(indices, (indices.len(),), &self.device)?;
+        for layer in self.layers.iter_mut() {
+            layer.keep_kv_indices(&idx_tensor)?;
+        }
+        // Drop the cached attention masks since cache_len may have changed.
+        self.masks.clear();
         Ok(())
     }
 }

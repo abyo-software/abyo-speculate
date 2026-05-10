@@ -101,9 +101,18 @@ impl LlamaQuantDecoder {
 
     /// Apply the model's quantized lm_head — exposed so EAGLE's draft
     /// loop can re-use the target's vocab projection without owning a
-    /// separate copy.
+    /// separate copy. Auto-promotes the input to F32 (the dtype the Q4
+    /// QMatMul kernel expects) so callers can pass BF16/F16 draft
+    /// hiddens directly.
     pub fn apply_lm_head(&self, hidden: &Tensor) -> Result<Tensor> {
-        self.model.apply_lm_head(hidden).map_err(Error::Candle)
+        let hidden_owned;
+        let hidden_use: &Tensor = if hidden.dtype() != DType::F32 {
+            hidden_owned = hidden.to_dtype(DType::F32).map_err(Error::Candle)?;
+            &hidden_owned
+        } else {
+            hidden
+        };
+        self.model.apply_lm_head(hidden_use).map_err(Error::Candle)
     }
 
     pub fn encode(&self, text: &str, add_special_tokens: bool) -> Result<Vec<u32>> {
@@ -144,6 +153,30 @@ impl LlamaQuantDecoder {
             t.to_dtype(DType::F32).map_err(Error::Candle)?
         };
         t.to_vec1::<f32>().map_err(Error::Candle)
+    }
+
+    /// Like [`Decoder::observe`], but additionally returns the last
+    /// position's hidden state from the same forward pass. EAGLE's run
+    /// loop uses this to chain the deepest committed token's hidden into
+    /// the next round's draft input without a separate
+    /// [`Self::last_hidden_state`] forward.
+    pub fn observe_returning_last_hidden(&mut self, ids: &[u32]) -> Result<Tensor> {
+        if ids.is_empty() {
+            return Err(Error::Sampling(
+                "observe_returning_last_hidden with empty ids".into(),
+            ));
+        }
+        let input = Tensor::new(ids, &self.device)
+            .and_then(|t| t.unsqueeze(0))
+            .map_err(Error::Candle)?;
+        let hidden = self
+            .model
+            .forward_hidden(&input, self.cache_len)
+            .map_err(Error::Candle)?;
+        self.cache_len += ids.len();
+        self.history.extend_from_slice(ids);
+        let last_idx = hidden.dim(1).map_err(Error::Candle)? - 1;
+        hidden.i((0, last_idx, ..)).map_err(Error::Candle)
     }
 
     pub fn last_hidden_state(&mut self) -> Result<Tensor> {
@@ -279,6 +312,117 @@ impl LlamaQuantDecoder {
         debug_assert_eq!(self.cache_len, pre_cache_len);
         Ok(out)
     }
+
+    /// Tree forward optimised for the EAGLE inner loop.
+    ///
+    /// Differences from [`Self::tree_logits`]:
+    /// 1. Returns hidden states per node alongside the logits (the deepest
+    ///    accepted node's hidden state becomes the next round's draft input).
+    /// 2. Does **not** restore the KV cache to `prefix_len + 1` after the
+    ///    call. Cache state is left at `prefix_len + tree.len()` with all
+    ///    tree nodes' KVs in BFS order. The caller commits the accepted
+    ///    path via [`Self::commit_tree_path`] (one O(layers) index_select
+    ///    per layer, no extra forward).
+    /// 3. Skips the GEMV root-fix from v0.2.2 — non-strict mode trades a
+    ///    tiny per-token logit drift for a 2× target-side throughput gain.
+    ///
+    /// Returns `(per_node_logits, per_node_hidden)`.
+    pub fn tree_logits_keep_kv(
+        &mut self,
+        tree: &DraftTree,
+    ) -> Result<(Vec<Vec<f32>>, Vec<Tensor>)> {
+        if self.history.is_empty() {
+            return Err(Error::Sampling("tree_logits with empty history".into()));
+        }
+        let last_committed = *self.history.last().unwrap();
+        if tree.token_at(0) != last_committed {
+            return Err(Error::Sampling(format!(
+                "tree root ({}) must equal last committed token ({})",
+                tree.token_at(0),
+                last_committed
+            )));
+        }
+        let pre_cache_len = self.cache_len;
+        debug_assert_eq!(pre_cache_len, self.history.len());
+        let prefix_len = pre_cache_len - 1;
+
+        self.model
+            .truncate_kv_cache_to(prefix_len)
+            .map_err(Error::Candle)?;
+        self.cache_len = prefix_len;
+
+        let positions: Vec<u32> = (0..tree.len())
+            .map(|i| (prefix_len + tree.depth_of(i)) as u32)
+            .collect();
+        let position_tensor =
+            Tensor::from_vec(positions, (tree.len(),), &self.device).map_err(Error::Candle)?;
+        let bias = tree.full_attention_bias_4d(prefix_len, 1, 1, &self.device, DType::F32)?;
+        let input_ids = Tensor::from_slice(tree.tokens(), (1, tree.len()), &self.device)
+            .map_err(Error::Candle)?;
+
+        let hidden = self
+            .model
+            .forward_with_positions(&input_ids, &position_tensor, &bias)
+            .map_err(Error::Candle)?;
+        // Cache is now `prefix_len + tree.len()` (we deliberately don't
+        // restore — `commit_tree_path` handles the KV consolidation).
+        self.cache_len = prefix_len + tree.len();
+        let logits = self.model.apply_lm_head(&hidden).map_err(Error::Candle)?;
+        let logits = logits.i((0, .., ..)).map_err(Error::Candle)?;
+
+        let mut out_logits = Vec::with_capacity(tree.len());
+        let mut out_hidden = Vec::with_capacity(tree.len());
+        for i in 0..tree.len() {
+            let row = logits.i((i, ..)).map_err(Error::Candle)?;
+            out_logits.push(self.row_to_vec(&row)?);
+            out_hidden.push(hidden.i((0, i, ..)).map_err(Error::Candle)?);
+        }
+        Ok((out_logits, out_hidden))
+    }
+
+    /// After a [`Self::tree_logits_keep_kv`] call, commit the accepted tree
+    /// path to permanent KV cache state by reordering the cache to keep
+    /// only the accepted positions, and update history. **No target
+    /// forward is needed** — the accepted nodes' KVs are already in cache
+    /// from the tree forward, we just keep them and drop the rest.
+    ///
+    /// `accepted_indices` are tree node indices in BFS order from the root
+    /// (e.g. `[0, 1, 4]` = root → child[1] → grandchild[0] of child[1]).
+    /// Index 0 (root) is always present and equals the previous
+    /// `last_committed` token.
+    ///
+    /// To add a bonus / non-tree token after committing the path, follow
+    /// up with a normal [`Decoder::observe`] of the extra token(s).
+    pub fn commit_tree_path(
+        &mut self,
+        tree: &DraftTree,
+        accepted_indices: &[usize],
+    ) -> Result<()> {
+        if self.history.is_empty() {
+            return Err(Error::Sampling(
+                "commit_tree_path with empty history".into(),
+            ));
+        }
+        debug_assert!(!accepted_indices.is_empty() && accepted_indices[0] == 0);
+        let last_committed = *self.history.last().unwrap();
+        debug_assert_eq!(tree.token_at(0), last_committed);
+        let prefix_len = self.history.len() - 1;
+
+        let mut keep: Vec<u32> = Vec::with_capacity(prefix_len + accepted_indices.len());
+        for i in 0..prefix_len {
+            keep.push(i as u32);
+        }
+        for &ti in accepted_indices {
+            keep.push((prefix_len + ti) as u32);
+        }
+        self.model.keep_kv_indices(&keep).map_err(Error::Candle)?;
+        self.cache_len = keep.len();
+
+        for &ti in accepted_indices.iter().skip(1) {
+            self.history.push(tree.token_at(ti));
+        }
+        Ok(())
+    }
 }
 
 impl TreeDecoder for LlamaQuantDecoder {
@@ -307,6 +451,25 @@ impl TreeDecoder for LlamaQuantDecoder {
 
     fn embed_tokens(&self, input_ids: &Tensor) -> Result<Tensor> {
         LlamaQuantDecoder::embed_tokens(self, input_ids)
+    }
+
+    fn tree_logits_keep_kv(
+        &mut self,
+        tree: &DraftTree,
+    ) -> Result<(Vec<Vec<f32>>, Vec<Tensor>)> {
+        LlamaQuantDecoder::tree_logits_keep_kv(self, tree)
+    }
+
+    fn observe_returning_last_hidden(&mut self, ids: &[u32]) -> Result<Tensor> {
+        LlamaQuantDecoder::observe_returning_last_hidden(self, ids)
+    }
+
+    fn commit_tree_path(
+        &mut self,
+        tree: &DraftTree,
+        accepted_indices: &[usize],
+    ) -> Result<()> {
+        LlamaQuantDecoder::commit_tree_path(self, tree, accepted_indices)
     }
 }
 

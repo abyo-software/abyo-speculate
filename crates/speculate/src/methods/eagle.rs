@@ -493,7 +493,13 @@ where
     use crate::methods::medusa::top_k_indices;
 
     target.reset();
-    target.observe(prompt)?;
+    if prompt.is_empty() {
+        return Err(Error::Sampling("EAGLE requires non-empty prompt".into()));
+    }
+    // Observe the prompt and capture the final hidden state in one
+    // forward — chained into the next round so we never call
+    // `last_hidden_state` separately.
+    let mut target_hidden = target.observe_returning_last_hidden(prompt)?;
 
     let mut generated = Vec::with_capacity(max_new_tokens);
     while generated.len() < max_new_tokens {
@@ -502,9 +508,7 @@ where
             .last()
             .ok_or_else(|| Error::Sampling("EAGLE requires non-empty prompt".into()))?;
 
-        // 1. Get target's hidden state for the most recent committed token.
-        let target_hidden = target.last_hidden_state()?;
-        // Reshape to [1, 1, hidden] for draft.forward.
+        // Reshape stored hidden to [1, 1, hidden] for draft.forward.
         let hidden_reshaped = target_hidden
             .unsqueeze(0)
             .map_err(Error::Candle)?
@@ -577,8 +581,10 @@ where
             full_tree
         };
 
-        // 4. Verify via target's tree_logits.
-        let per_node_logits = target.tree_logits(&tree)?;
+        // 4. Verify via the EAGLE fast-path: tree forward returns
+        //    (logits, hidden) per node and leaves the KV cache populated
+        //    with the tree (no restoration forward).
+        let (per_node_logits, _per_node_hidden) = target.tree_logits_keep_kv(&tree)?;
 
         // 5. Walk paths, greedy acceptance.
         let mut best_path: Vec<usize> = vec![0];
@@ -611,44 +617,65 @@ where
             }
         }
 
-        // 6. Commit + bonus.
+        // 6. Bonus token from the deepest accepted node's distribution.
+        let deepest_idx = *best_path.last().unwrap();
+        let bonus = per_node_logits[deepest_idx]
+            .iter()
+            .enumerate()
+            .fold((0usize, f32::NEG_INFINITY), |(bi, bv), (i, &v)| {
+                if v > bv {
+                    (i, v)
+                } else {
+                    (bi, bv)
+                }
+            })
+            .0 as u32;
+
+        // Compose the committed sequence (accepted draft tokens + bonus)
+        // for the generated transcript. EOS check applies to the full
+        // sequence; if hit we truncate and stop after this round.
         let mut committed: Vec<u32> = best_path
             .iter()
             .skip(1)
             .map(|&i| tree.token_at(i))
             .collect();
-        let deepest_idx = *best_path.last().unwrap();
-        if generated.len() + committed.len() < max_new_tokens {
-            let bonus_logits = &per_node_logits[deepest_idx];
-            let bonus = bonus_logits
-                .iter()
-                .enumerate()
-                .fold((0usize, f32::NEG_INFINITY), |(bi, bv), (i, &v)| {
-                    if v > bv {
-                        (i, v)
-                    } else {
-                        (bi, bv)
-                    }
-                })
-                .0 as u32;
-            committed.push(bonus);
-        }
-
-        if committed.is_empty() {
-            return Err(Error::Sampling("EAGLE round committed zero tokens".into()));
-        }
-
-        // Truncate at EOS so we don't generate garbage past the natural
-        // stopping point. The target's `eos_token_ids()` defines the stop
-        // set (e.g. Llama 3 uses {128001, 128009}, Llama 2 uses {2}).
+        committed.push(bonus);
         let eos_set = target.eos_token_ids();
         let eos_pos = committed.iter().position(|t| eos_set.contains(t));
         let stop = eos_pos.is_some();
         if let Some(p) = eos_pos {
-            committed.truncate(p + 1); // include the EOS token in the output
+            committed.truncate(p + 1);
         }
 
-        target.observe(&committed)?;
+        // 7. Commit accepted path to KV cache via index_select reordering
+        //    (no target forward — the accepted nodes' KVs are already in
+        //    cache from the tree forward). Then `observe([bonus])` to add
+        //    the bonus token's KV — that's the only real target forward
+        //    on the commit side, and it's just one token wide.
+        //
+        //    If EOS landed inside the accepted draft path, truncate the
+        //    kept path to just up to the EOS node; the bonus + remainder
+        //    are skipped.
+        let path_committed: Vec<u32> = best_path
+            .iter()
+            .skip(1)
+            .map(|&i| tree.token_at(i))
+            .collect();
+        let path_eos_index = path_committed.iter().position(|t| eos_set.contains(t));
+        if let Some(idx) = path_eos_index {
+            // EOS in accepted draft path: keep root + accepted up to and
+            // including the EOS node; no bonus forward.
+            let kept_path: Vec<usize> = best_path[..=idx + 1].to_vec();
+            target.commit_tree_path(&tree, &kept_path)?;
+            // No new target_hidden is computed; loop will exit via `stop`.
+        } else {
+            // Normal: commit full accepted path, then observe(bonus) and
+            // capture the bonus's hidden state for the next round's draft
+            // input — replaces the per-round `last_hidden_state()` forward.
+            target.commit_tree_path(&tree, &best_path)?;
+            target_hidden = target.observe_returning_last_hidden(&[bonus])?;
+        }
+
         generated.extend_from_slice(&committed);
         if stop {
             break;

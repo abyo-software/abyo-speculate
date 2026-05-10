@@ -694,8 +694,9 @@ where
             full_tree
         };
 
-        // 4. Verify via target.tree_logits.
-        let per_node_logits = target.tree_logits(&tree)?;
+        // 4. Verify via the EAGLE fast path (tree forward, no restoration,
+        //    KV stays populated for commit_tree_path below).
+        let (per_node_logits, _per_node_hidden) = target.tree_logits_keep_kv(&tree)?;
 
         // 5. Greedy acceptance.
         let mut best_path: Vec<usize> = vec![0];
@@ -728,33 +729,27 @@ where
             }
         }
 
-        let mut committed: Vec<u32> = best_path
+        let deepest_idx = *best_path.last().unwrap();
+        let bonus = per_node_logits[deepest_idx]
+            .iter()
+            .enumerate()
+            .fold((0usize, f32::NEG_INFINITY), |(bi, bv), (i, &v)| {
+                if v > bv {
+                    (i, v)
+                } else {
+                    (bi, bv)
+                }
+            })
+            .0 as u32;
+
+        let path_committed: Vec<u32> = best_path
             .iter()
             .skip(1)
             .map(|&i| tree.token_at(i))
             .collect();
-        let deepest_idx = *best_path.last().unwrap();
-        if generated.len() + committed.len() < max_new_tokens {
-            let bonus_logits = &per_node_logits[deepest_idx];
-            let bonus = bonus_logits
-                .iter()
-                .enumerate()
-                .fold((0usize, f32::NEG_INFINITY), |(bi, bv), (i, &v)| {
-                    if v > bv {
-                        (i, v)
-                    } else {
-                        (bi, bv)
-                    }
-                })
-                .0 as u32;
-            committed.push(bonus);
-        }
+        let mut committed = path_committed.clone();
+        committed.push(bonus);
 
-        if committed.is_empty() {
-            return Err(Error::Sampling("EAGLE-3 round committed zero tokens".into()));
-        }
-
-        // Honour the target's EOS set so we stop on natural end-of-text.
         let eos_set = target.eos_token_ids();
         let eos_pos = committed.iter().position(|t| eos_set.contains(t));
         let stop = eos_pos.is_some();
@@ -762,7 +757,17 @@ where
             committed.truncate(p + 1);
         }
 
-        target.observe(&committed)?;
+        // Commit via KV reorder (no extra forward), then observe(bonus)
+        // for its KV — same fast path as run_eagle.
+        let path_eos_index = path_committed.iter().position(|t| eos_set.contains(t));
+        if let Some(idx) = path_eos_index {
+            let kept_path: Vec<usize> = best_path[..=idx + 1].to_vec();
+            target.commit_tree_path(&tree, &kept_path)?;
+        } else {
+            target.commit_tree_path(&tree, &best_path)?;
+            target.observe(&[bonus])?;
+        }
+
         generated.extend_from_slice(&committed);
         if stop {
             break;

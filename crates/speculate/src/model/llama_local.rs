@@ -128,6 +128,34 @@ impl Cache {
             .unwrap_or(0)
     }
 
+    /// Reorder every per-layer KV cache so the new sequence is exactly the
+    /// rows at `indices` (in the given order). Used by EAGLE/EAGLE-3 to
+    /// commit the accepted tree path's KVs without re-running the target
+    /// over them.
+    ///
+    /// `indices` are absolute cache positions (typically
+    /// `[0, 1, ..., prefix_len - 1, prefix_len + tree_offset_for_root, ...]`).
+    /// The caller is responsible for ensuring the listed positions have
+    /// RoPE encodings matching their *new* index in the cache (which
+    /// holds for accepted paths because tree positions encode `prefix_len + depth`).
+    pub fn keep_kv_indices(&mut self, indices: &[u32]) -> Result<()> {
+        if indices.is_empty() {
+            self.clear();
+            return Ok(());
+        }
+        let idx_tensor = Tensor::from_slice(indices, (indices.len(),), &self.device)?;
+        for slot in self.kvs.iter_mut() {
+            if let Some((k, v)) = slot.as_ref() {
+                let k_c = k.contiguous()?;
+                let v_c = v.contiguous()?;
+                let new_k = k_c.index_select(&idx_tensor, 2)?.contiguous()?;
+                let new_v = v_c.index_select(&idx_tensor, 2)?.contiguous()?;
+                *slot = Some((new_k, new_v));
+            }
+        }
+        Ok(())
+    }
+
     /// Drop everything from every per-layer KV cache.
     pub fn clear(&mut self) {
         for slot in self.kvs.iter_mut() {
